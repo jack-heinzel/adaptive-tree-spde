@@ -17,10 +17,12 @@ from math import factorial
 
 import numpy as np
 import jax
+jax.config.update("jax_enable_x64", True)   # float64 required: linalg.solve in float32
+                                              # produces inaccurate x values and divergences
 import jax.numpy as jnp
 import blackjax
 from jax_tqdm import scan_tqdm
-from scipy.linalg import eigh
+from scipy.linalg import eigh as sp_eigh
 from scipy.sparse import coo_array
 
 
@@ -54,8 +56,11 @@ def build_observation_matrix(nodes, tri, data_points):
     T  = tri.transform[idx, :d, :]   # (n_valid, d, d)
     v0 = tri.transform[idx,  d, :]   # (n_valid, d)
     bary_rest = np.einsum("nij,nj->ni", T, pts - v0)        # (n_valid, d)
-    bary_0    = 1.0 - bary_rest.sum(axis=1, keepdims=True)  # (n_valid, 1)
-    bary      = np.hstack([bary_0, bary_rest])               # (n_valid, d+1)
+    bary_last = 1.0 - bary_rest.sum(axis=1, keepdims=True)  # (n_valid, 1) — λ for simplices[idx, d]
+    # scipy stores the LAST simplex vertex as the reference point (transform[i, d, :]),
+    # so bary_rest gives λ for vertices 0..d-1 and bary_last gives λ for vertex d.
+    # Order must match tri.simplices[idx] = [v0, v1, ..., vd].
+    bary = np.hstack([bary_rest, bary_last])                 # (n_valid, d+1)
 
     valid_rows = np.where(valid)[0]
     rows = np.repeat(valid_rows, d + 1)
@@ -76,30 +81,24 @@ def _simplex_areas(nodes, simplices):
 # JAX log-posterior
 # ---------------------------------------------------------------------------
 
-def make_log_posterior(Q, nodes, simplices, tri, data_points, obs_bounds=None):
+def make_log_posterior(Q, nodes, simplices, tri, data_points):
     """
     Build a JAX log-posterior with Q fixed (kappa already chosen).
 
     Position: {'mu': scalar, 'x': array(n_nodes,)}.
 
-    Parameters
-    ----------
-    obs_bounds : list of (lo, hi) per dimension, optional
-        The observation domain, e.g. [(0,1),(0,1)].  Only nodes inside
-        obs_bounds contribute to the likelihood integral ∫ λ ds.  Buffer /
-        boundary nodes still regularise the field via Q but do not consume
-        any of the 'n_obs budget', so the Gamma posterior E[N_obs] = n_obs
-        holds over the observation domain rather than the larger mesh domain.
-        Defaults to the full mesh (all nodes), which over-normalises when the
-        mesh extends beyond the observation domain.
+    The integral ∫ λ ds is computed over the full mesh (including any buffer
+    nodes).  A buffer of width ε adds ~4ε of extra area; for ε=1e-3 this is
+    <0.5% of [0,1]² and is absorbed by mu.  Using the full mesh keeps
+    data_term and the integral consistent — masking the integral but not
+    data_term creates an unbalanced likelihood gradient on buffer nodes that
+    causes NUTS divergences in joint hyperparameter inference.
     """
     areas     = _simplex_areas(nodes, simplices)
     A         = build_observation_matrix(nodes, tri, data_points)
     data_term = np.asarray(A.sum(axis=0)).ravel()
     n_obs     = len(data_points)
 
-    # Lumped mass: c_i = sum_{T containing i} |T| / (d+1)
-    # Approximates ∫ λ ds ≈ Σ_i c_i exp(μ + x_i), consistent with FEM prior.
     d        = nodes.shape[1]
     n_nodes  = len(nodes)
     c_lumped = np.bincount(
@@ -108,34 +107,24 @@ def make_log_posterior(Q, nodes, simplices, tri, data_points, obs_bounds=None):
         minlength=n_nodes,
     )
 
-    # Mask to observation domain: buffer nodes get weight 0 in the likelihood
-    # integral so they don't consume the n_obs normalisation budget.
-    if obs_bounds is not None:
-        lo = np.array([b[0] for b in obs_bounds])
-        hi = np.array([b[1] for b in obs_bounds])
-        in_obs = np.all((nodes >= lo) & (nodes <= hi), axis=1)
-        c_lumped_obs = c_lumped * in_obs
-    else:
-        c_lumped_obs = c_lumped
-
-    Q_jax            = jnp.array(Q.toarray())
-    c_lumped_obs_jax = jnp.array(c_lumped_obs)
-    data_term_jax    = jnp.array(data_term)
+    Q_jax         = jnp.array(Q.toarray())
+    c_lumped_jax  = jnp.array(c_lumped)
+    data_term_jax = jnp.array(data_term)
 
     def log_posterior(position):
         mu = position["mu"]
         x  = position["x"]
-        integral = jnp.dot(c_lumped_obs_jax, jnp.exp(mu + x))
+        integral = jnp.dot(c_lumped_jax, jnp.exp(mu + x))
         ll = n_obs * mu + jnp.dot(data_term_jax, x) - integral
         lp = -0.5 * jnp.dot(x, Q_jax @ x)
         return ll + lp
 
     meta = {
         "n_obs":       n_obs,
-        "domain_area": float(c_lumped_obs.sum()),  # obs-domain area (≈ area of obs_bounds)
+        "domain_area": float(c_lumped.sum()),
         "data_term":   data_term,
         "areas":       areas,
-        "c_lumped":    c_lumped_obs,   # diagnostic: (exp(mu+x) @ c_lumped).mean() ≈ n_obs
+        "c_lumped":    c_lumped,
     }
     return log_posterior, meta
 
@@ -147,48 +136,35 @@ def make_log_posterior_with_hyperparams(
     log_kappa_std    = 1.0,
     log_sigma_mean   = 0.0,
     log_sigma_std    = 1.0,
-    obs_bounds       = None,
 ):
     """
     Build a JAX log-posterior that jointly infers (mu, log_kappa, log_sigma, x).
 
     Model
     -----
-        log lambda(s) = mu + sigma * x(s)
-        x   ~ N(0, Q^{-1}(kappa))     Matern SPDE prior
-        mu  ~ flat                     mean log-intensity
-        kappa ~ log-Normal prior       inverse range
-        sigma ~ log-Normal prior       marginal std of log-intensity deviations
+        log lambda(s) = mu + x(s)
+        x ~ N(0, sigma^2 Q(kappa)^{-1})        centred Matern SPDE prior
+        Q = K(kappa) C_lump^{-1} K(kappa),  K = kappa^2 C + G
+        kappa ~ log-Normal prior              inverse range
+        sigma ~ log-Normal prior              field amplitude
 
-    sigma separates the amplitude of spatial variation from the range (kappa).
-    Without sigma, the amplitude is fixed by kappa via the Matern marginal variance
-    sigma_x^2 = 1/(4 pi kappa^2) (for alpha=2, d=2); with kappa=6 this is ~0.002,
-    far too small to fit data with ~1 log-unit of variation.
+    Centred parameterisation
+    -------------------------
+    x is sampled directly.  The prior precision Q/sigma^2 varies with kappa
+    and sigma so the NUTS mass matrix adapted at warmup is imperfect elsewhere.
+    This is acceptable when the likelihood is sufficiently informative.
 
-    K(kappa) = kappa^2 * C + G is assembled inside the callable so JAX can
-    differentiate through it.  For alpha=2 the precision of x is
+    log|K(kappa)| is computed cheaply via the generalised eigenvalue pencil.
+    K = kappa^2 C + G  →  G v = mu C v  (solved once, O(n^3)).
+    Then  log|K(kappa)| = log|C| + sum_i log(kappa^2 + mu_i),  O(n) per step.
+    Its gradient w.r.t. log_kappa is 2*kappa^2 * sum_i 1/(kappa^2 + mu_i), also O(n).
 
-        Q(kappa) = K  diag(C_lumped)^{-1}  K
-
-    and its log-determinant is
-
-        log det Q = 2 log det K  -  sum_i log c_i
+    Log-prior on x:
+        lp_x = log|K(kappa)| - n*log(sigma) - xQx / (2*sigma^2)
+    where xQx = (Kx)^T C_lump^{-1} (Kx)  — one matrix-vector product, O(n^2).
 
     Position: {'mu': scalar, 'log_kappa': scalar, 'log_sigma': scalar,
                'x': array(n_nodes,)}.
-
-    Parameterisation note — centred form avoids Neal's funnel
-    ----------------------------------------------------------
-    x is the log-intensity field directly (not a scaled white noise).
-    sigma enters the PRIOR on x, not the likelihood:
-
-        x   ~ N(0, sigma^2 Q^{-1})
-        log lambda(s) = mu + x(s)
-
-    The prior log-density is -0.5/sigma^2 * x^T Q x + 0.5 log|Q| - n*log(sigma).
-    The -n*log(sigma) Jacobian (n = number of nodes) strongly anchors sigma,
-    preventing the runaway that occurs when sigma multiplies x in the likelihood
-    (which lets (2*sigma, x/2) give identical likelihoods with a better x prior).
 
     Parameters
     ----------
@@ -196,66 +172,56 @@ def make_log_posterior_with_hyperparams(
     nodes, simplices : mesh geometry
     tri              : scipy.spatial.Delaunay
     data_points      : observed Poisson process points
-    alpha            : SPDE smoothness order (integer, default 2)
-    log_kappa_mean   : prior mean for log_kappa; defaults to log of 1/(3*range)
-                       where range ~ 0.3 * domain diameter
-    log_kappa_std    : prior std for log_kappa (default 1.0, weakly informative)
+    alpha            : SPDE smoothness order (only 2 supported)
+    log_kappa_mean   : prior mean for log_kappa; defaults to log(3 / (0.3 * diam))
+    log_kappa_std    : prior std for log_kappa (default 1.0)
     log_sigma_mean   : prior mean for log_sigma (default 0.0 → sigma=1)
-    log_sigma_std    : prior std for log_sigma (default 1.0, allows sigma in ~[0.05, 20])
-    obs_bounds       : list of (lo, hi) per dimension, optional.
-                       Restricts the likelihood integral ∫ λ ds to the
-                       observation domain (see make_log_posterior for details).
+    log_sigma_std    : prior std for log_sigma (default 1.0)
     """
+    if alpha != 2:
+        raise NotImplementedError("Only alpha=2 is implemented")
+
     areas     = _simplex_areas(nodes, simplices)
     A         = build_observation_matrix(nodes, tri, data_points)
     data_term = np.asarray(A.sum(axis=0)).ravel()
     n_obs     = len(data_points)
+    n_nodes   = len(nodes)
 
-    # Full lumped mass — used for the FEM prior Q (must cover the whole mesh).
     c_lumped = np.asarray(C.sum(axis=1)).ravel()
 
-    # Obs-domain lumped mass — used only for the likelihood integral.
-    if obs_bounds is not None:
-        lo = np.array([b[0] for b in obs_bounds])
-        hi = np.array([b[1] for b in obs_bounds])
-        in_obs = np.all((nodes >= lo) & (nodes <= hi), axis=1)
-        c_lumped_obs = c_lumped * in_obs
-    else:
-        c_lumped_obs = c_lumped
-
-    # Default kappa prior: centred on kappa that gives range ~ 30% of domain
     if log_kappa_mean is None:
-        domain_diam   = np.sqrt(float(areas.sum())) * 2   # crude estimate
+        domain_diam    = np.sqrt(float(areas.sum())) * 2
         log_kappa_mean = float(np.log(3.0 / (0.3 * domain_diam)))
 
-    # Precomputed constants (do not depend on kappa)
-    log_det_C_inv = -float(np.sum(np.log(c_lumped)))   # -sum log c_i
+    # --- One-time O(n^3) precomputation ---
+    C_arr = C.toarray()
+    G_arr = G.toarray()
 
-    # Generalized eigenvalues mu_i of  G v = mu C v  (one-time O(n³) cost).
-    # Gives  log det K(kappa) = log det C + sum_i log(kappa² + mu_i),
-    # reducing per-step log det from O(n³) to O(n).
-    # Valid only when K = kappa²C + G is a scalar pencil (stationary kappa).
-    # Non-stationary kappa or H would require SLQ or dense slogdet instead.
-    G_dense = G.toarray()
-    C_dense = C.toarray()
-    mu_eig = eigh(G_dense, C_dense, eigvals_only=True)           # (n,)
-    _, log_det_C = np.linalg.slogdet(C_dense)
-    log_det_C = float(log_det_C)
+    # Generalised eigenvalues of the pencil (G, C): G v = mu C v.
+    # log|K(kappa)| = log|C| + sum_i log(kappa^2 + mu_i)  — O(n) per step.
+    mu_eig    = sp_eigh(G_arr, C_arr, eigvals_only=True)   # (n_nodes,)
+    log_C_det = float(np.linalg.slogdet(C_arr)[1])
 
-    n_nodes = len(nodes)
+    # Sparse COO structure for K @ x = kappa^2*(C @ x) + (G @ x).
+    # K is never formed explicitly; scatter-add over nnz ~ 7n entries — O(n) per step.
+    C_coo  = C.tocsr().tocoo()
+    spm_rows = C_coo.row
+    spm_cols = C_coo.col
+    spm_c    = C_coo.data                                        # C nonzero values
+    spm_g    = np.asarray(G.tocsr()[spm_rows, spm_cols]).ravel() # G at same positions
 
-    # JAX arrays
-    C_jax                = jnp.array(C_dense)
-    G_jax                = jnp.array(G_dense)
-    c_lumped_inv_jax     = jnp.array(1.0 / c_lumped)
-    c_lumped_obs_jax     = jnp.array(c_lumped_obs)
-    mu_jax               = jnp.array(mu_eig)
-    data_term_jax        = jnp.array(data_term)
-    log_kappa_mean_j     = jnp.array(log_kappa_mean)
-    log_kappa_std_j      = jnp.array(log_kappa_std)
-    log_sigma_mean_j     = jnp.array(log_sigma_mean)
-    log_sigma_std_j      = jnp.array(log_sigma_std)
-    n_nodes_j            = jnp.array(float(n_nodes))
+    mu_eig_jax    = jnp.array(mu_eig)
+    spm_rows_j    = jnp.array(spm_rows)
+    spm_cols_j    = jnp.array(spm_cols)
+    spm_c_j       = jnp.array(spm_c)
+    spm_g_j       = jnp.array(spm_g)
+    c_lumped_jax  = jnp.array(c_lumped)
+    data_term_jax = jnp.array(data_term)
+    log_kappa_mean_j = jnp.array(log_kappa_mean)
+    log_kappa_std_j  = jnp.array(log_kappa_std)
+    log_sigma_mean_j = jnp.array(log_sigma_mean)
+    log_sigma_std_j  = jnp.array(log_sigma_std)
+    log_C_det_j      = jnp.array(log_C_det)
 
     def log_posterior(position):
         mu        = position["mu"]
@@ -266,43 +232,53 @@ def make_log_posterior_with_hyperparams(
         kappa = jnp.exp(log_kappa)
         sigma = jnp.exp(log_sigma)
 
-        # ---- build K and Q ------------------------------------------------
-        K = kappa ** 2 * C_jax + G_jax                   # (n, n)
-        # Q = K diag(c_inv) K  via  (K * c_inv[None,:]) @ K
-        Q = (K * c_lumped_inv_jax[None, :]) @ K           # (n, n)
+        # K @ x via sparse pencil: O(nnz) ~ O(n) for 2-D meshes
+        k_vals = kappa**2 * spm_c_j + spm_g_j
+        Kx = jnp.zeros(n_nodes).at[spm_rows_j].add(k_vals * x[spm_cols_j])
+        xQx = jnp.dot(Kx, Kx / c_lumped_jax)           # x^T Q x, Q = K C_lump^{-1} K
 
-        # ---- log det K via precomputed generalized eigenvalues  O(n) -------
-        log_det_K = log_det_C + jnp.sum(jnp.log(kappa ** 2 + mu_jax))
-        log_det_Q = 2.0 * log_det_K + log_det_C_inv
+        # log|K(kappa)| via pencil eigenvalues: O(n)
+        log_det_K = log_C_det_j + jnp.sum(jnp.log(kappa**2 + mu_eig_jax))
+        lp_x = log_det_K - n_nodes * log_sigma - 0.5 * xQx / sigma**2
 
-        # ---- Gaussian prior on x: x ~ N(0, sigma^2 Q^{-1}) ----------------
-        # log p(x|sigma,kappa) = -0.5/sigma^2 * x^T Q x
-        #                        + 0.5 log|Q| - n_nodes * log(sigma)
-        # The -n_nodes*log(sigma) Jacobian anchors sigma (prevents funnel).
-        lp_x = (-0.5 / sigma ** 2 * jnp.dot(x, Q @ x)
-                 + 0.5 * log_det_Q
-                 - n_nodes_j * log_sigma)
-
-        # ---- LGCP likelihood: log lambda = mu + x (sigma absorbed into x) -
-        integral = jnp.dot(c_lumped_obs_jax, jnp.exp(mu + x))
+        integral = jnp.dot(c_lumped_jax, jnp.exp(mu + x))
         ll       = n_obs * mu + jnp.dot(data_term_jax, x) - integral
 
-        # ---- hyperpriors on log_kappa and log_sigma -----------------------
-        lp_kappa = -0.5 * ((log_kappa - log_kappa_mean_j) / log_kappa_std_j) ** 2
-        lp_sigma = -0.5 * ((log_sigma - log_sigma_mean_j) / log_sigma_std_j) ** 2
+        lp_kappa = -0.5 * ((log_kappa - log_kappa_mean_j) / log_kappa_std_j)**2
+        lp_sigma = -0.5 * ((log_sigma - log_sigma_mean_j) / log_sigma_std_j)**2
 
         return ll + lp_x + lp_kappa + lp_sigma
 
     meta = {
         "n_obs":          n_obs,
-        "domain_area":    float(c_lumped_obs.sum()),
+        "domain_area":    float(c_lumped.sum()),
         "data_term":      data_term,
         "areas":          areas,
         "log_kappa_mean": log_kappa_mean,
         "log_sigma_mean": log_sigma_mean,
-        "c_lumped":       c_lumped_obs,
+        "c_lumped":       c_lumped,
     }
     return log_posterior, meta
+
+
+def recover_x_samples(samples, C, G):
+    """
+    Convert whitened eps back to the field x = sigma * K(kappa)^{-1} diag(sqrt(c)) * eps.
+
+    Call this after run_nuts when using make_log_posterior_with_hyperparams.
+    Adds key "x" to the returned dict so predict_intensity works unchanged.
+    """
+    kappas  = np.exp(np.array(samples["log_kappa"]))   # (S,)
+    sigmas  = np.exp(np.array(samples["log_sigma"]))   # (S,)
+    epses   = np.array(samples["eps"])                 # (S, n)
+    C_arr   = np.asarray(C.toarray())
+    G_arr   = np.asarray(G.toarray())
+    c_sqrt  = np.sqrt(np.asarray(C.sum(axis=1)).ravel())
+    xs = np.array([
+        sigmas[s] * np.linalg.solve(kappas[s] ** 2 * C_arr + G_arr, c_sqrt * epses[s])
+        for s in range(len(kappas))
+    ])
+    return {**samples, "x": xs}
 
 
 # ---------------------------------------------------------------------------
@@ -347,9 +323,12 @@ def run_nuts(
     rng_key = jax.random.PRNGKey(seed)
 
     if init_position is None:
+        # "c_lumped_sqrt" in meta signals the whitened (eps) parameterisation;
+        # otherwise the centred (x) parameterisation is used.
+        field_key = "eps" if "c_lumped_sqrt" in meta else "x"
         init_position = {
-            "mu": jnp.array(np.log(meta["n_obs"] / meta["domain_area"])),
-            "x":  jnp.zeros(n_nodes),
+            "mu":      jnp.array(np.log(meta["n_obs"] / meta["domain_area"])),
+            field_key: jnp.zeros(n_nodes),
         }
         if "log_kappa_mean" in meta:
             init_position["log_kappa"] = jnp.array(meta["log_kappa_mean"])
@@ -402,27 +381,40 @@ def run_nuts(
 # Posterior prediction
 # ---------------------------------------------------------------------------
 
-def predict_intensity(samples, nodes, tri, eval_points):
+def predict_intensity(samples, nodes, tri, eval_points, obs_bounds=None):
     """
     Posterior predictive intensity at eval_points.
 
     Parameters
     ----------
-    samples     : dict from run_nuts — keys include 'mu' (S,), 'x' (S, n_nodes),
-                  and optionally 'log_sigma' (S,) when sigma was inferred.
+    samples     : dict from run_nuts — keys include 'mu' (S,), 'x' (S, n_nodes).
     nodes       : array (n_nodes, d)
     tri         : scipy.spatial.Delaunay
     eval_points : array (n_eval, d)
+    obs_bounds  : list of (lo, hi) per dimension, optional.
+        If given, any eval point whose containing triangle has at least one vertex
+        outside obs_bounds is masked to NaN.  This prevents buffer nodes (which
+        carry no likelihood weight) from inflating posterior variance at the
+        observation-domain boundary.
 
     Returns
     -------
     lam : array (S, n_eval) — posterior samples of lambda(s);
-          NaN for eval_points outside the triangulation.
+          NaN for eval_points outside the triangulation or adjacent to buffer nodes.
     """
     eval_points = np.asarray(eval_points, dtype=float)
     d  = nodes.shape[1]
     si = tri.find_simplex(eval_points)
     valid = si >= 0
+
+    if obs_bounds is not None and valid.any():
+        lo = np.array([b[0] for b in obs_bounds])
+        hi = np.array([b[1] for b in obs_bounds])
+        in_obs = np.all((nodes >= lo) & (nodes <= hi), axis=1)  # (n_nodes,)
+        # Mask out eval points whose triangle contains any buffer vertex
+        vtx_in_obs = in_obs[tri.simplices[si[valid]]]           # (n_valid, d+1)
+        valid_idx  = np.where(valid)[0]
+        valid[valid_idx[~vtx_in_obs.all(axis=1)]] = False
 
     mu_samples = np.array(samples["mu"])   # (S,)
     x_samples  = np.array(samples["x"])   # (S, n_nodes)  — x is the full field
@@ -437,8 +429,8 @@ def predict_intensity(samples, nodes, tri, eval_points):
         T  = tri.transform[idx, :d, :]
         v0 = tri.transform[idx,  d, :]
         bary_rest = np.einsum("nij,nj->ni", T, pts - v0)
-        bary_0    = 1.0 - bary_rest.sum(axis=1, keepdims=True)
-        bary      = np.hstack([bary_0, bary_rest])             # (n_valid, d+1)
+        bary_last = 1.0 - bary_rest.sum(axis=1, keepdims=True)  # λ for simplices[idx, d]
+        bary      = np.hstack([bary_rest, bary_last])            # (n_valid, d+1)
 
         vtx = tri.simplices[idx]                               # (n_valid, d+1)
 

@@ -382,6 +382,124 @@ Combining all terms, the log-posterior to be sampled is
 \end{align}
 
 % ============================================================
+\section{Stationary Anisotropic Extension}
+\label{sec:anisotropic}
+% ============================================================
+
+\subsection{Anisotropy Matrix Parameterisation}
+
+The isotropic model (Section~\ref{sec:hyperparams}) treats all directions
+equally through a scalar range parameter $\kappa$.  A stationary
+\emph{anisotropic} generalisation retains a constant diffusion tensor $H$ in
+\eqref{eq:spde-gen}.  In $\R^2$ we parameterise
+\begin{equation}
+  H = R(\theta)\,\diag(\kappa_x^2,\,\kappa_y^2)\,R(\theta)^T,
+  \label{eq:H-param}
+\end{equation}
+where $R(\theta)$ is the $2\times 2$ rotation matrix and $\kappa_x, \kappa_y > 0$
+are effective range parameters along the principal axes of the field.
+The elements of $H$ are
+\begin{align}
+  h_{11} &= \kappa_x^2\cos^2\!\theta + \kappa_y^2\sin^2\!\theta, \nonumber\\
+  h_{12} &= (\kappa_x^2 - \kappa_y^2)\cos\theta\sin\theta,           \label{eq:H-components} \\
+  h_{22} &= \kappa_x^2\sin^2\!\theta + \kappa_y^2\cos^2\!\theta.    \nonumber
+\end{align}
+The three parameters $(\log\kappa_x,\, \log\kappa_y,\, \theta)$ replace the
+single scalar $\log\kappa$ from the isotropic model; the marginal variance
+$\sigma$ remains a scalar.  The isotropic case is recovered by setting
+$\kappa_x = \kappa_y$ (any $\theta$), yielding $H = \kappa_x^2 I$.
+
+\subsection{FEM Basis Decomposition}
+\label{sec:aniso-fem}
+
+The anisotropic stiffness matrix
+\[
+G_{H,ij} = \int_\mathcal{D} \nabla\phi_i^T H\,\nabla\phi_j\,\dd s
+\]
+decomposes linearly over three basis matrices:
+\begin{equation}
+  G_H = h_{11}\,G_{xx} + h_{12}\,G_{xy} + h_{22}\,G_{yy},
+  \label{eq:GH-decomp}
+\end{equation}
+with
+\begin{align}
+  G_{xx,ij} &= \sum_\tau |\tau|\,
+    \partial_x\phi_i^{(\tau)}\,\partial_x\phi_j^{(\tau)}, \\
+  G_{yy,ij} &= \sum_\tau |\tau|\,
+    \partial_y\phi_i^{(\tau)}\,\partial_y\phi_j^{(\tau)}, \\
+  G_{xy,ij} &= \sum_\tau |\tau|\!\left(
+    \partial_x\phi_i^{(\tau)}\,\partial_y\phi_j^{(\tau)}
+    + \partial_y\phi_i^{(\tau)}\,\partial_x\phi_j^{(\tau)}\right).
+\end{align}
+All three matrices are assembled once from the fixed mesh prior to sampling and
+stored in COO sparse format.  The isotropic $G = G_{xx} + G_{yy}$ is the
+special case $H = I$.
+
+At each NUTS step, forming $G_H$ costs three sparse scalar-matrix additions, and
+the SPDE operator
+\begin{equation}
+  K(H) = C + G_H(H)
+  \label{eq:K-aniso}
+\end{equation}
+has the same sparsity pattern as the isotropic $K(\kappa)$.  Matrix--vector
+products $K(H)\bx$ therefore cost $O(\mathrm{nnz}) \approx O(m)$ via COO
+scatter-add, unchanged from the isotropic case.
+
+\subsection{Log-Determinant Challenge}
+\label{sec:logdet-aniso}
+
+Section~\ref{sec:logdet} showed that for the isotropic operator $K(\kappa) =
+\kappa^2 C + G$, the log-determinant reduces to $O(m)$ work per step once the
+generalised eigenpairs $G v_i = \mu_i C v_i$ have been precomputed:
+\[
+  \log|K(\kappa)| = \log|C| + \textstyle\sum_i \log(\kappa^2 + \mu_i).
+\]
+This is possible because $K$ is a \emph{scalar-affine} function of the single
+parameter $\kappa^2$: the eigenvectors $\{v_i\}$ are fixed and only the
+eigenvalues shift.
+
+For the anisotropic operator \eqref{eq:K-aniso}, the matrix
+$K(H) = C + h_{11}G_{xx} + h_{12}G_{xy} + h_{22}G_{yy}$
+is a linear combination of four sparse matrices whose coefficients
+$(h_{11}, h_{12}, h_{22})$ all change at every NUTS step.  No fixed eigenbasis
+can diagonalise $K(H)$ for all $H$ simultaneously: a generalised eigenproblem
+$K(H) v = \mu C v$ would need to be resolved whenever $(h_{11}, h_{12}, h_{22})$
+changes.
+
+Consequently, evaluating $\log|K(H)|$ requires a dense factorisation at each
+leapfrog step,
+\begin{equation}
+  \log|K(H)| = \texttt{slogdet}\bigl(K(H)\bigr),
+  \quad\text{cost } O(m^3) \text{ per step.}
+  \label{eq:slogdet-aniso}
+\end{equation}
+The gradient required by NUTS,
+\begin{equation}
+  \frac{\partial\log|K|}{\partial\theta_k}
+  = \tr\!\left(K^{-1}\frac{\partial K}{\partial\theta_k}\right),
+  \label{eq:grad-logdet-aniso}
+\end{equation}
+requires an implicit $K^{-1}$ solve for each of the three anisotropy
+parameters $(\log\kappa_x, \log\kappa_y, \theta)$, which JAX's automatic
+differentiation of \texttt{jnp.linalg.slogdet} provides via the implicit
+function theorem, again at $O(m^3)$ cost.
+
+For meshes of size $m \lesssim 500$ the per-step $O(m^3)$ cost is acceptable
+($\approx\!1$\,ms on a modern CPU), but it precludes scaling to
+$m \gtrsim 2000$.  Finding an efficient $O(m)$--$O(m\log m)$ approximation
+to $\log|K(H)|$ for parametric matrix pencils is an \textbf{open problem}.
+
+\begin{remark}[Stochastic Lanczos quadrature]
+One promising direction is \emph{stochastic Lanczos quadrature} (SLQ):
+estimate $\log|K|$ as $m\cdot\E_{\mathbf{u}}[\log\tilde\mu(\mathbf{u})]$,
+where $\tilde\mu$ is a stochastic Gauss quadrature approximation to the
+spectral measure of $K$, requiring only matrix--vector products with $K$
+(which remain $O(m)$).  The gradient \eqref{eq:grad-logdet-aniso} can be
+obtained by differentiating the Gauss nodes and weights with respect to $H$.
+This approach is left for future work.
+\end{remark}
+
+% ============================================================
 \section{MCMC Sampling with NUTS}
 % ============================================================
 
@@ -452,9 +570,11 @@ The pipeline is split across two Python modules and one Jupyter notebook:
 
 The \texttt{assemble\_fem\_matrices} function accepts a callable $H(s)$
 returning a $(T \times d \times d)$ array of per-simplex diffusion tensors,
-enabling non-stationary anisotropy.  Likewise, $\kappa(s)$ can be a callable
-returning per-simplex values; however, the eigenvalue log-det trick then no
-longer applies.
+enabling \emph{non-stationary} anisotropy.  Section~\ref{sec:anisotropic}
+covers the stationary anisotropic case in detail; the key remaining obstacle
+for both cases is the $O(m^3)$ log-determinant (Section~\ref{sec:logdet-aniso}).
+Likewise, $\kappa(s)$ can be a callable returning per-simplex values; the
+eigenvalue log-det trick then no longer applies.
 
 \subsection{Planned: Non-Gaussian Fields (Level 2)}
 
@@ -475,11 +595,14 @@ MCMC).
 \subsection{Scalability}
 
 The FEM assembly is fully vectorised (no Python loops over simplices) and runs
-in seconds for meshes up to $\sim 10^4$ nodes.  The dominant cost is the
-initial eigendecomposition (Section~\ref{sec:logdet}), which is $O(m^3)$ and
-takes $\sim 1$\,s for $m \approx 500$.  For larger meshes one would switch to
-a sparse Cholesky factorisation (e.g., via \textsc{CHOLMOD}) and accept $O(m)$
-per-step cost without the precomputed eigenvalues.
+in seconds for meshes up to $\sim 10^4$ nodes.  For the isotropic model, the
+dominant cost is the one-time eigendecomposition (Section~\ref{sec:logdet}),
+$O(m^3)$, taking $\sim 1$\,s for $m \approx 500$; each subsequent NUTS step
+costs $O(m)$.  For the anisotropic model, the $O(m^3)$ \texttt{slogdet} is paid
+\emph{every leapfrog step} (Section~\ref{sec:logdet-aniso}), limiting the
+practical mesh size to $m \lesssim 500$.  For larger isotropic meshes one would
+switch to a sparse Cholesky factorisation (e.g., via \textsc{CHOLMOD}) and
+accept $O(m)$ per-step cost without the precomputed eigenvalues.
 
 \bibliographystyle{plainnat}
 \bibliography{refs}
