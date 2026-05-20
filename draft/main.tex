@@ -1,0 +1,487 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+
+\geometry{margin=1in}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\DeclareMathOperator{\tr}{tr}
+\DeclareMathOperator{\diag}{diag}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\dd}{\,\mathrm{d}}
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\bs}{\mathbf{s}}
+\newcommand{\bphi}{\boldsymbol{\phi}}
+
+\title{Bayesian Inference for Inhomogeneous Poisson Processes\\
+via Adaptive FEM Triangulation and the Mat\'ern SPDE}
+\author{Jack Heinzel}
+\date{Draft --- \today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We describe a computational pipeline for inferring the intensity function of an
+inhomogeneous Poisson process over a $d$-dimensional domain.
+The log-intensity is modelled as a Gaussian random field whose prior is derived
+from the stochastic partial differential equation (SPDE) representation of the
+Mat\'ern covariance family \citep{lindgren2011}.
+The field is discretised on an adaptive triangulation driven by the observed
+point pattern, assembled with finite element methods (FEM), and sampled jointly
+with the hyperparameters $(\kappa, \sigma, \mu)$ using the No-U-Turn Sampler
+(NUTS) implemented in BlackJAX.
+We discuss several implementation subtleties: the domain-area correction for
+buffer nodes, an $O(n)$ eigenvalue trick for the log-determinant, and a centred
+parameterisation that eliminates Neal's funnel.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+% ============================================================
+\section{Problem Setting}
+% ============================================================
+
+Let $\mathcal{D} \subset \R^d$ be a bounded domain and let
+$\{s_1, \ldots, s_n\} \subset \mathcal{D}$ be a realisation of an
+\emph{inhomogeneous Poisson process} with intensity function $\lambda(s) \ge 0$.
+The likelihood for the observed point pattern is
+\begin{equation}
+  \log p(\{s_i\} \mid \lambda) = \sum_{i=1}^n \log \lambda(s_i) - \int_{\mathcal{D}} \lambda(s) \dd s.
+  \label{eq:poisson-ll}
+\end{equation}
+Our goal is Bayesian inference for $\lambda(\cdot)$ given only the $n$
+observed locations.  We adopt the \emph{Log-Gaussian Cox Process} (LGCP)
+model \citep{moller1998lgcp}, in which
+\begin{equation}
+  \log \lambda(s) = \mu + x(s), \qquad x \sim \mathcal{GP}(0, \sigma^2 C_\nu(\cdot,\cdot;\kappa)),
+  \label{eq:lgcp}
+\end{equation}
+where $\mu \in \R$ is a global mean (intercept), $x$ is a zero-mean Gaussian
+random field with Mat\'ern covariance $C_\nu$ parameterised by range $\kappa$
+and marginal standard deviation $\sigma$.
+
+% ============================================================
+\section{The Mat\'ern SPDE Prior}
+% ============================================================
+
+\subsection{Continuous SPDE}
+
+\citet{lindgren2011} show that a Gaussian random field with Mat\'ern covariance
+of smoothness $\nu$ and range $1/\kappa$ is the unique stationary solution of the
+SPDE
+\begin{equation}
+  (\kappa^2 - \Delta)^{\alpha/2} \, x(s) = \mathcal{W}(s), \quad s \in \R^d,
+  \label{eq:spde}
+\end{equation}
+where $\mathcal{W}$ is Gaussian white noise, $\Delta$ is the Laplacian, and
+$\alpha = \nu + d/2$.  For $d=2$ the integer case $\alpha=2$ ($\nu=1$) is most
+common and is the focus of this work.
+
+\subsection{Generalised Anisotropic SPDE}
+
+The stiffness operator can be generalised to allow spatially varying diffusion
+\begin{equation}
+  (\kappa(s)^2 - \nabla \cdot H(s) \nabla)^{\alpha/2} \, x(s) = \mathcal{W}(s),
+  \label{eq:spde-gen}
+\end{equation}
+where $H(s) \in \R^{d\times d}$ is a positive-definite diffusion tensor.
+Setting $H = I$ and $\kappa$ constant recovers \eqref{eq:spde}.
+
+\subsection{Marginal Variance}
+
+For the stationary isotropic case in $d=2$ with $\alpha=2$, the marginal
+variance of the field is
+\begin{equation}
+  \sigma_x^2 = \frac{1}{4\pi\kappa^2}.
+  \label{eq:margvar}
+\end{equation}
+For $\kappa = 6$ this gives $\sigma_x \approx 0.047$, far too small for
+intensity fields that vary by one or more log-units.  Including a free scale
+parameter $\sigma$ (Section~\ref{sec:hyperparams}) is therefore essential.
+
+% ============================================================
+\section{Adaptive Triangulation}
+% ============================================================
+
+\subsection{Recursive Equal-Count kd-Tree}
+
+We build a mesh that is automatically denser where the observed point pattern is
+dense.  Starting from a root cell covering the domain, we recursively split
+each cell along its longest axis at the data median until every leaf cell
+contains at most $n_{\max}$ points (the refinement threshold).  This is a
+\emph{balanced} kd-tree partition: each split divides the data approximately
+evenly, so the resulting leaf sizes are $O(n/n_{\rm leaves})$.
+
+The split value is clamped away from the cell boundary by a relative tolerance
+$\epsilon = 10^{-8}$ of the cell width, ensuring no degenerate child cell.
+
+\subsection{Mesh Nodes and Delaunay Triangulation}
+
+Each leaf cell contributes one node to the mesh: the centroid of its data
+points if the cell is non-empty, or the geometric cell midpoint otherwise.
+The $2^d$ corners of the bounding box are added as fixed boundary nodes.
+
+The Delaunay triangulation of all nodes defines the mesh $\mathcal{T}$.
+It is rebuilt from scratch after each refinement or coarsening step.
+
+\subsection{Buffer Region}
+
+To ensure the triangulation is regular near the domain boundary, the bounding
+box is taken slightly larger than the observation domain---typically
+$[-0.1, 1.1]^2$ when observations lie in $[0,1]^2$.  This introduces
+\emph{buffer nodes} in the extended region.  We account for them explicitly in
+the likelihood (Section~\ref{sec:obs-bounds}).
+
+% ============================================================
+\section{FEM Discretisation}
+% ============================================================
+
+\subsection{Basis Functions and Local Geometry}
+
+On the triangulation $\mathcal{T}$ with $m$ nodes and $T$ simplices, we use
+piecewise linear ``hat'' basis functions $\{\phi_i\}_{i=1}^m$.
+For simplex $\tau$ with vertices $v_0, \ldots, v_d$, the reference-to-physical
+map is
+\begin{equation}
+  B_\tau = [v_1 - v_0, \;\ldots\;, v_d - v_0] \in \R^{d\times d}.
+\end{equation}
+The volume of simplex $\tau$ is $|\tau| = |\det B_\tau| / d!$, and the physical
+gradient of the $j$-th local basis function is
+\begin{equation}
+  \nabla_s \phi_j^{(\tau)} = B_\tau^{-\top} \hat{e}_j, \quad j = 0, \ldots, d,
+\end{equation}
+where $\hat{e}_0 = -\mathbf{1}$ and $\hat{e}_j$ is the $j$-th standard basis
+vector for $j \ge 1$.
+
+\subsection{Mass Matrix}
+
+The global mass matrix $C \in \R^{m\times m}$ has entries
+\begin{equation}
+  C_{ij} = \int_\mathcal{D} \phi_i(s)\phi_j(s) \dd s
+         = \sum_{\tau \ni i,j} |\tau| \frac{1 + \delta_{ij}}{(d+1)(d+2)}.
+  \label{eq:mass}
+\end{equation}
+The assembled $C$ is symmetric positive definite with a sparsity pattern
+matching the mesh topology.
+
+\subsection{Stiffness Matrix}
+
+The isotropic stiffness matrix is
+\begin{equation}
+  G_{ij} = \int_\mathcal{D} \nabla\phi_i(s) \cdot \nabla\phi_j(s) \dd s
+         = \sum_{\tau \ni i,j} |\tau| \, \nabla\phi_i^{(\tau)} \cdot \nabla\phi_j^{(\tau)}.
+  \label{eq:stiff}
+\end{equation}
+For the generalised case \eqref{eq:spde-gen}, the integrand becomes
+$\nabla\phi_i^T H(\bar\tau) \nabla\phi_j$ where $H$ is evaluated at the simplex
+centroid $\bar\tau$.
+
+\subsection{SPDE Operator and Precision Matrix}
+
+The discretised SPDE operator is
+\begin{equation}
+  K = \kappa^2 C + G.
+  \label{eq:K}
+\end{equation}
+For $\alpha=2$ the Galerkin approximation of the fractional operator
+$(\kappa^2-\Delta)^2$ yields the precision matrix
+\begin{equation}
+  Q = K \, \tilde{C}^{-1} \, K, \qquad \tilde{C} = \diag(C\mathbf{1}),
+  \label{eq:Q}
+\end{equation}
+where $\tilde{C}$ is the \emph{lumped} mass matrix.  Unlike the
+intrinsic GMRF (ICAR) commonly used in disease mapping, $Q$ is positive
+definite for any $\kappa > 0$, so the prior is proper.
+
+For general smoothness order $\alpha \ge 1$,
+\begin{equation}
+  Q = K \bigl(\tilde{C}^{-1} K\bigr)^{\alpha-1}.
+\end{equation}
+
+% ============================================================
+\section{Likelihood Discretisation}
+% ============================================================
+
+\subsection{Observation Matrix}
+
+For observation $s_i$ lying in simplex $\tau(i)$ with vertices
+$v_0^{(i)}, \ldots, v_d^{(i)}$, let $\lambda_i = (\lambda_{v_0^{(i)}}, \ldots,
+\lambda_{v_d^{(i)}})$ be the nodal values.  By piecewise linear interpolation,
+\begin{equation}
+  \log\hat\lambda(s_i) = \mu + \sum_{j=0}^{d} b_{ij} \, x_{v_j^{(i)}},
+\end{equation}
+where $b_{ij} \ge 0$ are the barycentric coordinates of $s_i$ in $\tau(i)$.
+
+The sum term in \eqref{eq:poisson-ll} becomes $\sum_i x_{v_j^{(i)}} b_{ij} = A\bx$
+where $A \in \R^{n \times m}$ is the sparse barycentric projection matrix.
+Because the $i$-th row of $A$ is the barycentric coordinates of $s_i$, and
+since barycentric coordinates sum to one, the log-likelihood can be written as
+\begin{equation}
+  \sum_{i=1}^n \log\lambda(s_i) = n\mu + \mathbf{d}^T \bx,
+  \label{eq:data-term}
+\end{equation}
+where the \emph{data-accumulation vector} $\mathbf{d} \in \R^m$ is
+$d_j = \sum_{i : v_j \in \tau(i)} b_{ij}$, assembled by scattering barycentric
+weights to their respective nodes.
+
+\subsection{Integral Approximation and Lumped Mass Quadrature}
+
+The integral $\int_\mathcal{D} \lambda(s) \dd s$ is approximated by a
+nodal quadrature rule.  Expanding $\lambda(s) = \exp(\mu + x(s))$ and
+integrating the piecewise linear interpolant gives
+\begin{equation}
+  \int_\mathcal{D} \exp\!\bigl(\mu + x(s)\bigr) \dd s
+  \approx \sum_{j=1}^m c_j \exp(\mu + x_j),
+  \qquad c_j = \int_\mathcal{D} \phi_j(s) \dd s = \tilde{C}_{jj}.
+  \label{eq:integral-approx}
+\end{equation}
+The lumped weights $c_j = \tilde{C}_{jj} = (C\mathbf{1})_j$ equal the area
+contributed to node $j$ across all incident simplices, specifically
+$c_j = \sum_{\tau \ni j} |\tau|/(d+1)$.
+
+\subsection{Domain Correction for Buffer Nodes}
+\label{sec:obs-bounds}
+
+When the mesh bounding box $\hat{\mathcal{D}}$ is larger than the observation
+domain $\mathcal{D}_{\rm obs}$, the buffer nodes $j \notin \mathcal{D}_{\rm obs}$
+have $c_j > 0$ but lie outside the region over which the Poisson likelihood is
+defined.  Including them inflates the integral, biasing $\mu$ downward.
+
+The fix is to zero the lumped weights for buffer nodes before forming the integral:
+\begin{equation}
+  \tilde{c}_j = c_j \cdot \mathbf{1}[s_j \in \mathcal{D}_{\rm obs}].
+  \label{eq:obs-bounds}
+\end{equation}
+With this correction, the likelihood integral is $\sum_j \tilde{c}_j \exp(\mu+x_j)$,
+which integrates only over the observation domain.
+
+\subsection{Posterior Normalization Property}
+\label{sec:gamma-posterior}
+
+\begin{proposition}
+Under a flat prior $p(\mu) \propto 1$ and the LGCP likelihood \eqref{eq:poisson-ll}
+with the quadrature \eqref{eq:integral-approx}, the conditional posterior of the
+expected total count $N = \sum_j \tilde{c}_j \exp(\mu + x_j)$, given $\bx$, is
+$\mathrm{Gamma}(n, 1)$ with mean $n$.
+\end{proposition}
+
+\begin{proof}
+Let $Z(\bx) = \sum_j \tilde{c}_j e^{x_j}$.  The log-posterior in $\mu$,
+$p(\mu \mid \bx, \{s_i\}) \propto \exp(n\mu - Z(\bx) e^\mu)$,
+is the kernel of a $\mathrm{Gamma}(n, 1/Z(\bx))$ distribution on
+$N = Z(\bx)e^\mu$.  Hence $\E[N \mid \bx] = n$ for any realization of
+$\bx$.
+\end{proof}
+
+This property provides a useful diagnostic: after sampling, the posterior mean
+of $\sum_j \tilde{c}_j \exp(\hat\mu + \hat x_j)$ should equal $n$.  Without
+the domain correction~\eqref{eq:obs-bounds}, the guarantee holds for the full
+mesh domain $\hat{\mathcal{D}}$ rather than $\mathcal{D}_{\rm obs}$.
+
+% ============================================================
+\section{Joint Inference for Hyperparameters}
+\label{sec:hyperparams}
+% ============================================================
+
+\subsection{Parameterisation and Prior}
+
+We infer $(\mu, \kappa, \sigma, \bx)$ jointly.  The model is
+\begin{align}
+  \log\kappa &\sim \mathcal{N}(\mu_\kappa, \sigma_\kappa^2), \\
+  \log\sigma  &\sim \mathcal{N}(\mu_\sigma, \sigma_\sigma^2), \\
+  \bx \mid \kappa, \sigma &\sim \mathcal{N}(0,\; \sigma^2 Q(\kappa)^{-1}), \\
+  \{s_i\} \mid \mu, \bx &\sim \text{LGCP with } \log\lambda = \mu + \bx.
+  \label{eq:model}
+\end{align}
+
+\subsection{Centred Parameterisation to Avoid Neal's Funnel}
+\label{sec:centred}
+
+A non-centred parameterisation $\bx = \sigma \tilde\bx$ with
+$\tilde\bx \sim \mathcal{N}(0, Q^{-1})$ creates a \emph{Neal's funnel}
+\citep{neal2003slice}: the joint distribution
+$({\sigma, \tilde\bx})$ and $(2\sigma, \tilde\bx/2)$ produce nearly identical
+likelihood values, yet the prior on $\tilde\bx$ \emph{improves} as
+$\tilde\bx \to 0$, giving the sampler a free gradient towards $\sigma \to \infty$
+with $\tilde\bx \to 0$.  Traces of $\log\sigma$ diverge.
+
+The \emph{centred parameterisation} resolves this by working directly with
+$\bx$ in \eqref{eq:model}.  The prior log-density is
+\begin{equation}
+  \log p(\bx \mid \kappa, \sigma) =
+    -\frac{1}{2\sigma^2} \bx^T Q \bx
+    + \tfrac{1}{2}\log|Q|
+    - m \log\sigma
+    + \text{const},
+  \label{eq:log-prior-x}
+\end{equation}
+where the $-m\log\sigma$ term (the Jacobian for the change-of-variables
+$\bx \to \tilde\bx = \bx/\sigma$) strongly penalises large $\sigma$.
+For $m \approx 130$ nodes, increasing $\sigma$ by a factor of 10 costs
+$130 \log 10 \approx 299$ log-units in prior density.
+
+\subsection{Log-Determinant via Generalised Eigenvalues}
+\label{sec:logdet}
+
+The log-prior \eqref{eq:log-prior-x} requires $\log|Q(\kappa)| = 2\log|K(\kappa)| - \log|\tilde{C}|$.
+Recomputing $\log|K|$ at every MCMC step via Cholesky costs $O(m^3)$ per
+iteration.  We reduce this to $O(m)$ via the spectral decomposition.
+
+\begin{proposition}[Eigenvalue log-det trick]
+Let $G v_i = \mu_i C v_i$ be the generalised eigenproblem (computed once,
+$O(m^3)$).  Then for any scalar $\kappa$,
+\begin{equation}
+  \log|K(\kappa)| = \log|C| + \sum_{i=1}^m \log(\kappa^2 + \mu_i).
+  \label{eq:logdet-trick}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Factorise $K = \kappa^2 C + G = C(\kappa^2 I + C^{-1}G)$.  Then
+$\log|K| = \log|C| + \log|\kappa^2 I + C^{-1}G|$.
+The matrix $C^{-1}G$ has eigenvalues $\mu_i$, so
+$\log|\kappa^2 I + C^{-1}G| = \sum_i \log(\kappa^2 + \mu_i)$.
+\end{proof}
+
+The eigenpairs $\{(\mu_i, v_i)\}$ are computed once before sampling via
+\texttt{scipy.linalg.eigh}; within BlackJAX, \eqref{eq:logdet-trick} reduces
+the log-determinant evaluation to a single sum over eigenvalues.
+
+\begin{remark}
+This trick requires scalar $\kappa$.  For non-stationary fields where
+$\kappa(s)$ varies, the pencil $K(\kappa) = \diag(\kappa^2)C + G$ is no longer
+a polynomial in a single scalar, and stochastic Lanczos quadrature (SLQ) would
+be needed instead.
+\end{remark}
+
+\subsection{Full Log-Posterior}
+
+Combining all terms, the log-posterior to be sampled is
+\begin{align}
+  \log p(\mu, \log\kappa, \log\sigma, \bx \mid \{s_i\})
+  &= \underbrace{n\mu + \mathbf{d}^T \bx - \sum_j \tilde{c}_j e^{\mu+x_j}}_{\text{Poisson likelihood}} \notag \\
+  &\quad - \underbrace{\frac{1}{2\sigma^2}\bx^T Q \bx + \frac{1}{2}\log|Q| - m\log\sigma}_{\text{SPDE prior on } \bx}
+  \label{eq:log-posterior} \\
+  &\quad - \underbrace{\frac{(\log\kappa - \mu_\kappa)^2}{2\sigma_\kappa^2}
+         + \frac{(\log\sigma - \mu_\sigma)^2}{2\sigma_\sigma^2}}_{\text{hyperparameter priors}}. \notag
+\end{align}
+
+% ============================================================
+\section{MCMC Sampling with NUTS}
+% ============================================================
+
+\subsection{BlackJAX and Window Adaptation}
+
+We use the No-U-Turn Sampler \citep{hoffman2014nuts} as implemented in
+BlackJAX \citep{blackjax2024}, a JAX-native library for Bayesian computation.
+JAX's \texttt{jit}-compilation and automatic differentiation compute the
+gradient of \eqref{eq:log-posterior} efficiently.
+
+The step size and a diagonal mass matrix are tuned during a warm-up phase using
+dual-averaging window adaptation.  After warm-up, samples are drawn and thinned
+via a nested \texttt{jax.lax.scan} for memory efficiency.
+
+\subsection{Initialisation}
+
+The sampler is initialised at
+\begin{equation}
+  \mu^{(0)} = \log\!\left(\frac{n}{\sum_j \tilde{c}_j}\right),
+  \quad \bx^{(0)} = \mathbf{0},
+  \quad \log\kappa^{(0)} = \mu_\kappa,
+  \quad \log\sigma^{(0)} = \mu_\sigma.
+  \label{eq:init}
+\end{equation}
+The initialisation $\mu^{(0)}$ ensures the expected total count under the
+prior equals $n$, consistent with Proposition~\ref{sec:gamma-posterior}.
+
+\subsection{Posterior Prediction}
+
+Given posterior samples $\{(\mu^{(s)}, \bx^{(s)})\}_{s=1}^S$, the intensity
+at any evaluation point $s^* \in \mathcal{D}$ is obtained by barycentric
+interpolation:
+\begin{equation}
+  \hat\lambda^{(s)}(s^*) = \exp\!\left(\mu^{(s)} + \sum_{j=0}^d b_j(s^*) x^{(s)}_{v_j(s^*)}\right),
+\end{equation}
+where $(v_0, \ldots, v_d)$ are the vertices of the containing simplex and
+$(b_0, \ldots, b_d)$ are the barycentric coordinates of $s^*$.
+Points outside the mesh return \texttt{NaN}.
+
+% ============================================================
+\section{Implementation Summary}
+% ============================================================
+
+The pipeline is split across two Python modules and one Jupyter notebook:
+
+\begin{description}
+  \item[\texttt{triangulation.py}] Adaptive kd-tree mesh construction
+    (\texttt{AdaptiveKDMesh}) and vectorised FEM assembly
+    (\texttt{assemble\_fem\_matrices}, \texttt{precision\_matrix}).
+    Supports isotropic and anisotropic diffusion tensors $H$.
+
+  \item[\texttt{inference.py}] Log-posterior construction
+    (\texttt{make\_log\_posterior}, \texttt{make\_log\_posterior\_with\_hyperparams}),
+    NUTS runner (\texttt{run\_nuts}), and posterior prediction
+    (\texttt{predict\_intensity}).
+
+  \item[\texttt{spde\_triangulation.ipynb}] Demonstration on synthetic data from
+    a Gaussian mixture Poisson process.  Compares fixed-$\kappa$ and
+    joint-hyperparameter models; visualises posterior median intensity,
+    point-wise uncertainty, and parameter traces.
+\end{description}
+
+% ============================================================
+\section{Discussion and Extensions}
+% ============================================================
+
+\subsection{Extensions Already Scaffolded}
+
+The \texttt{assemble\_fem\_matrices} function accepts a callable $H(s)$
+returning a $(T \times d \times d)$ array of per-simplex diffusion tensors,
+enabling non-stationary anisotropy.  Likewise, $\kappa(s)$ can be a callable
+returning per-simplex values; however, the eigenvalue log-det trick then no
+longer applies.
+
+\subsection{Planned: Non-Gaussian Fields (Level 2)}
+
+The current LGCP assumes a Gaussian field, which may be unsuitable for intensity
+functions with sharp discontinuities.  Planned extensions include:
+\begin{itemize}
+  \item \textbf{$\alpha$-stable SPDE}: replace Gaussian white noise $\mathcal{W}$
+    with an $\alpha$-stable L\'evy sheet, yielding a Cauchy or heavy-tailed field;
+  \item \textbf{Jump-diffusion SPDE}: add a compound Poisson term to the SPDE,
+    allowing finite jumps over infinitesimal regions.
+\end{itemize}
+
+Both extensions require replacing the Gaussian prior log-density in
+\eqref{eq:log-posterior} with a non-Gaussian counterpart and potentially
+switching to a different sampler (e.g., elliptical slice sampling or particle
+MCMC).
+
+\subsection{Scalability}
+
+The FEM assembly is fully vectorised (no Python loops over simplices) and runs
+in seconds for meshes up to $\sim 10^4$ nodes.  The dominant cost is the
+initial eigendecomposition (Section~\ref{sec:logdet}), which is $O(m^3)$ and
+takes $\sim 1$\,s for $m \approx 500$.  For larger meshes one would switch to
+a sparse Cholesky factorisation (e.g., via \textsc{CHOLMOD}) and accept $O(m)$
+per-step cost without the precomputed eigenvalues.
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}
