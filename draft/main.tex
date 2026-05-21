@@ -540,6 +540,188 @@ $(b_0, \ldots, b_d)$ are the barycentric coordinates of $s^*$.
 Points outside the mesh return \texttt{NaN}.
 
 % ============================================================
+\section{Adaptive Triangulation via Reversible-Jump MCMC}
+\label{sec:rjmcmc}
+% ============================================================
+
+\subsection{Refinement Tree}
+
+We augment the static triangulation with a \emph{ternary refinement tree}.
+Every triangle in the initial mesh is a root.  A \emph{birth move} splits a
+leaf triangle $\tau^*$ at its barycenter $s^*$, replacing $\tau^*$ by the
+three child triangles $(s^*,v_0,v_1)$, $(s^*,v_1,v_2)$, $(s^*,v_0,v_2)$.
+A \emph{death move} is the exact reverse: if all three children of an
+interior node $s^*$ are currently leaves, they are merged back into their
+parent $\tau^*$ and $s^*$ is removed.  Birth and death are exact inverses,
+so detailed balance is achievable.
+
+Let $N_m$ be the number of leaf (birth-eligible) triangles and $M_m$ the
+number of removable (death-eligible) nodes in mesh $m$.  After a birth on
+$\tau^*$:
+\begin{equation}
+  N_{m'} = N_m + 2, \qquad
+  M_{m'} = M_m + 1
+           - \mathbf{1}\bigl[\text{all-leaf children test fails for parent}(s^*)\bigr],
+  \label{eq:NM-update}
+\end{equation}
+where parent$(s^*)$ is the node whose earlier birth created $\tau^*$
+(undefined for root triangles, so the indicator is 0 there).
+
+\subsection{Conditional Prior Proposal}
+\label{sec:rj-proposal}
+
+After the 3-split the extended mesh $m'$ has $n_m+1$ nodes.  The SPDE prior
+on the augmented field $(\mathbf{x}_m,x^*)$ is
+$\mathcal{N}(0,\sigma^2 Q'^{-1})$ with $Q'=K'(\tilde{C}')^{-1}K'$.
+Partitioning $Q'$ into the old nodes $(-*)$ and the new node $(*)$:
+\begin{equation}
+  Q' = \begin{pmatrix} Q'_{-*} & (Q'_{*-})^T \\ Q'_{*-} & Q'_{**} \end{pmatrix},
+\end{equation}
+the conditional prior of $x^*$ given the existing field is the
+one-dimensional Gaussian
+\begin{equation}
+  x^*\mid\mathbf{x}_m,m',\kappa,\sigma
+  \;\sim\; \mathcal{N}\!\left(\bar{x}^*,\;\frac{\sigma^2}{Q'_{**}}\right),
+  \qquad
+  \bar{x}^* = -\frac{Q'_{*-}\,\mathbf{x}_m}{Q'_{**}}.
+  \label{eq:cond-prior-rj}
+\end{equation}
+Since $s^*$ connects only to $\{v_0,v_1,v_2\}$ in the mesh graph,
+$K'_{*j}=0$ for $j\notin\{*,v_0,v_1,v_2\}$, and therefore
+$Q'_{*j} = \sum_{k\in\{*,v_0,v_1,v_2\}} K'_{*k}(\tilde{c}'_k)^{-1}K'_{kj}$.
+Both $Q'_{**}$ and $Q'_{*-}$ depend on $O(1)$ FEM values assembled from the
+three new triangles; their evaluation is an $O(1)$ local computation.
+
+\subsection{RJMCMC Acceptance Ratio}
+\label{sec:rj-acceptance}
+
+We propose $x^*$ from the conditional prior $q_*(x^*)=p(x^*\mid\mathbf{x}_m,m',\kappa,\sigma)$.
+The standard Green (1995) acceptance ratio for the birth move is
+\begin{equation}
+  \alpha_\mathrm{b} = \min\!\left(1,\;
+    \frac{\pi(m',\,\mathbf{x}_{m'})}
+         {\pi(m,\,\mathbf{x}_m)}\cdot
+    \frac{q_d\,N_m}{q_b\,M_{m'}\,q_*(x^*)}
+  \right),
+  \label{eq:rj-raw}
+\end{equation}
+where $q_b,q_d$ are the probabilities of attempting a birth or death move and
+$\pi(m,\mathbf{x}_m)\propto p(m)\,p(\mathbf{x}_m\mid m,\kappa,\sigma)\,L(m,\mathbf{x}_m,\mu)$
+is the unnormalised posterior.  (The Jacobian of the $u\to x^*$ transformation
+cancels exactly against the proposal density by the change-of-variables
+identity $q_*(x^*)\,|dx^*/du|^{-1}=\phi(u)$.)
+
+\paragraph{Simplification via conditional prior proposal.}
+Substituting $q_*(x^*)=p(\mathbf{x}_m,x^*\mid m')/p(\mathbf{x}_m\mid m')$ into \eqref{eq:rj-raw}:
+\begin{align}
+  \frac{p(\mathbf{x}_m,x^*\mid m')}
+       {q_*(x^*)\,p(\mathbf{x}_m\mid m)}
+  &= \frac{p(\mathbf{x}_m,x^*\mid m')}{p(\mathbf{x}_m\mid m')}\cdot
+     \frac{p(\mathbf{x}_m\mid m')}{p(\mathbf{x}_m\mid m)}
+     \cdot\frac{p(\mathbf{x}_m\mid m')}{p(\mathbf{x}_m,x^*\mid m')/p(\mathbf{x}_m\mid m')}
+     \nonumber \\[-6pt]
+  &= \frac{p(\mathbf{x}_m\mid m')}{p(\mathbf{x}_m\mid m)}, \nonumber
+\end{align}
+so the acceptance ratio reduces to
+\begin{equation}
+  \alpha_\mathrm{b} = \min\!\left(1,\;
+    \underbrace{\frac{p(\mathbf{x}_m\mid m',\kappa,\sigma)}
+                     {p(\mathbf{x}_m\mid m,\kappa,\sigma)}}_{\mathcal{R}_\mathrm{prior}}
+    \cdot
+    \underbrace{\frac{L(m',\mathbf{x}_{m'},\mu)}
+                     {L(m,\mathbf{x}_m,\mu)}}_{\mathcal{R}_L}
+    \cdot
+    \underbrace{\frac{p(m')}{p(m)}}_{\mathcal{R}_m}
+    \cdot\frac{q_d\,N_m}{q_b\,M_{m'}}
+  \right).
+  \label{eq:rj-acc}
+\end{equation}
+The proposal density $q_*$ does not appear in \eqref{eq:rj-acc}: the
+conditional-prior proposal absorbs the prior factor exactly, leaving only
+the ratio of \emph{marginal} prior densities on the old nodes.  The death
+move acceptance ratio is $\min(1,\alpha_\mathrm{b}^{-1})$.
+
+\subsection{Marginal Prior Ratio}
+\label{sec:rj-prior}
+
+The marginal distribution of $\mathbf{x}_m$ under mesh $m'$ has precision equal
+to the Schur complement of $Q'$:
+\begin{equation}
+  Q'_\mathrm{SC}
+  = Q'_{-*} - \frac{(Q'_{*-})^T Q'_{*-}}{Q'_{**}},
+  \label{eq:schur}
+\end{equation}
+so $p(\mathbf{x}_m\mid m')=\mathcal{N}(\mathbf{x}_m;0,\sigma^2 Q_\mathrm{SC}'^{-1})$.
+Using the block determinant identity $|Q'|=Q'_{**}\cdot|Q'_\mathrm{SC}|$:
+\begin{equation}
+  \log\mathcal{R}_\mathrm{prior}
+  = \underbrace{\tfrac{1}{2}\log\!\frac{|Q'|}{Q'_{**}\,|Q|}}_{\text{log-det term}}
+    - \underbrace{\frac{\mathbf{x}_m^T(Q'_\mathrm{SC}-Q)\,\mathbf{x}_m}{2\sigma^2}}_{\text{quadratic term}}.
+  \label{eq:log-R-prior}
+\end{equation}
+
+\paragraph{Quadratic term.}
+Writing $Q'_{*-}\mathbf{x}_m = -Q'_{**}\bar{x}^*$ (from \eqref{eq:cond-prior-rj}):
+\begin{equation}
+  \mathbf{x}_m^T Q'_\mathrm{SC}\,\mathbf{x}_m
+  = \mathbf{x}_m^T Q'_{-*}\,\mathbf{x}_m - Q'_{**}(\bar{x}^*)^2.
+  \label{eq:quad-SC}
+\end{equation}
+The matrix $Q'_{-*}-Q$ has nonzero entries only in rows and columns
+$\{v_0,v_1,v_2\}$ (FEM entries change only within the split triangle), so
+the quadratic form $\mathbf{x}_m^T(Q'_\mathrm{SC}-Q)\mathbf{x}_m$ is an
+$O(1)$ local computation.
+
+\paragraph{Log-determinant term.}
+Writing $|Q'|/|Q| = |K'|^2|\tilde{C}|\,/\,(|K|^2|\tilde{C}'|)$, the
+lumped-mass ratio $|\tilde{C}'|/|\tilde{C}|=\tilde{c}'_*\prod_{i}(\tilde{c}'_{v_i}/\tilde{c}_{v_i})$
+is a product of $O(1)$ scalars.  For the stiffness ratio, denote the change to
+the existing nodes' block as $\delta K = K'_{-*}-K$ (nonzeros in rows/cols
+$\{v_0,v_1,v_2\}$ only).  Writing $\delta K = E\,\Delta_3\,E^T$ where
+$E\in\R^{n_m\times 3}$ selects the columns for $\{v_0,v_1,v_2\}$, the
+matrix determinant lemma gives
+\begin{equation}
+  \log\frac{|K'_{-*}|}{|K|}
+  = \log\bigl|I_3 + \Delta_3\,(E^T K^{-1} E)\bigr|,
+  \label{eq:MDL-K}
+\end{equation}
+requiring three linear solves with $K$.  The $**$ Schur complement of $K'$
+then contributes an additional scalar log-term:
+\begin{equation}
+  \log|K'| = \log|K'_{-*}| + \log\!\left(k'_{**} - (\delta k_{*-})^T(K'_{-*})^{-1}\delta k_{*-}\right),
+  \label{eq:K-full-det}
+\end{equation}
+where $\delta k_{*-}\in\R^{n_m}$ is the new $*$-column of $K'$ (nonzero only
+at $v_0,v_1,v_2$), computable with one further sparse solve.
+
+\subsection{Likelihood Ratio}
+\label{sec:rj-ll}
+
+Because only the triangles touching $\tau^*$ change, the log-likelihood ratio
+is local:
+\begin{equation}
+  \log\mathcal{R}_L
+  = \!\sum_{i:\,s_i\in\tau^*}\!\!\!\log\frac{\hat\lambda'(s_i)}{\hat\lambda(s_i)}
+  - \left[\tilde{c}'_{s^*}e^{\mu+x^*}
+    + \sum_{j\in\{v_0,v_1,v_2\}}\!(\tilde{c}'_{v_j}-\tilde{c}_{v_j})\,e^{\mu+x_{v_j}}\right].
+  \label{eq:rj-ll}
+\end{equation}
+The first sum covers only the $O(n/N_m)$ observations falling inside $\tau^*$,
+using barycentric weights recomputed in the new child triangles.
+
+\subsection{Mesh Prior}
+\label{sec:mesh-prior}
+
+A natural choice is a geometric prior on the number of leaf triangles:
+\begin{equation}
+  p(m) \propto \rho^{N_m-N_0}, \qquad 0<\rho<1,
+  \label{eq:mesh-prior}
+\end{equation}
+where $N_0$ is the initial triangle count and $\rho$ controls the expected
+depth of refinement.  Under \eqref{eq:mesh-prior}, $\mathcal{R}_m=\rho^2$
+for every birth move (two new leaves added).
+
+% ============================================================
 \section{Implementation Summary}
 % ============================================================
 
