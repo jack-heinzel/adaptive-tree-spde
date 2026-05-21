@@ -151,6 +151,66 @@ the likelihood (Section~\ref{sec:obs-bounds}).
 \section{FEM Discretisation}
 % ============================================================
 
+\subsection{Galerkin Weak Form}
+\label{sec:galerkin}
+
+The Galerkin method turns the SPDE into a finite-dimensional linear system
+in two steps.
+
+\textbf{Step 1 --- approximate the field.}  Represent $x(s)$ as a linear
+combination of hat basis functions:
+\begin{equation}
+  x(s) \approx \sum_{j=1}^m x_j\,\phi_j(s),
+  \label{eq:fem-approx}
+\end{equation}
+reducing the unknown field to $m$ nodal values $\mathbf{x}\in\R^m$.
+
+\textbf{Step 2 --- enforce the PDE weakly.}  Rather than requiring the SPDE
+to hold pointwise (which would be too strong for the piecewise-linear
+approximation), we require the residual to be orthogonal to every basis
+function $\phi_i$.  For the $\alpha=1$ SPDE
+$(\kappa^2-\Delta)x=\mathcal{W}$, this means
+\begin{equation}
+  \int_\mathcal{D} \phi_i(s)\,\bigl[(\kappa^2-\Delta)x(s)\bigr]\dd s
+  = \int_\mathcal{D} \phi_i(s)\,\mathcal{W}(s)\dd s, \quad i=1,\ldots,m.
+  \label{eq:galerkin-condition}
+\end{equation}
+The Laplacian term is handled by \emph{integration by parts}
+(Green's first identity):
+\begin{equation}
+  \int_\mathcal{D} \phi_i\,(-\Delta x)\dd s
+  = \int_\mathcal{D} \nabla\phi_i\cdot\nabla x\dd s,
+  \label{eq:ibp}
+\end{equation}
+where the boundary term vanishes.  This step is essential: $\phi_i$ is
+piecewise linear and its second derivatives are zero almost everywhere, so the
+left side of \eqref{eq:ibp} would be unusable; the right side requires only
+first derivatives, which are constant and well-defined on each simplex.
+
+Substituting \eqref{eq:fem-approx} into the left-hand side of
+\eqref{eq:galerkin-condition} and collecting:
+\begin{equation}
+  \sum_j x_j \Bigl[\kappa^2\!\int\!\phi_i\phi_j\dd s
+                  +\int\!\nabla\phi_i\cdot\nabla\phi_j\dd s\Bigr]
+  = \sum_j x_j\,[\kappa^2 C_{ij} + G_{ij}]
+  = [K\mathbf{x}]_i.
+  \label{eq:lhs}
+\end{equation}
+For the right-hand side, projecting white noise onto $\phi_i$ gives
+$z_i = \langle\phi_i,\mathcal{W}\rangle$ with
+$\mathrm{Cov}(z_i,z_j)=\langle\phi_i,\phi_j\rangle=C_{ij}$,
+so $\mathbf{z}\sim\mathcal{N}(0,C)$.
+
+The Galerkin system is therefore the discrete stochastic equation
+\begin{equation}
+  K\mathbf{x} = \mathbf{z}, \qquad \mathbf{z}\sim\mathcal{N}(0,C),
+  \label{eq:galerkin-system}
+\end{equation}
+with $K=\kappa^2 C+G$ assembling the two bilinear forms identified in
+\eqref{eq:lhs}.  Sections~\ref{sec:mass}--\ref{sec:stiffness} define $C$ and $G$
+explicitly; Section~\ref{sec:spde-op} derives the precision matrix from
+\eqref{eq:galerkin-system}.
+
 \subsection{Basis Functions and Local Geometry}
 
 On the triangulation $\mathcal{T}$ with $m$ nodes and $T$ simplices, we use
@@ -204,6 +264,7 @@ $B_\tau$ is constant on $\tau$, so is $\nabla_s\phi_j^{(\tau)}$: the hat
 function is a flat ramp, and \eqref{eq:grad-phi} gives its slope.
 
 \subsection{Mass Matrix}
+\label{sec:mass}
 
 The mass matrix $C \in \R^{m\times m}$ has entries
 \begin{equation}
@@ -231,6 +292,7 @@ the hat-function basis, this becomes $\kappa^2 C$: the mass matrix is the
 FEM discretisation of the identity operator, weighted by local area.
 
 \subsection{Stiffness Matrix}
+\label{sec:stiffness}
 
 The stiffness matrix $G \in \R^{m\times m}$ has entries
 \begin{equation}
@@ -267,25 +329,41 @@ the spring network directionally, making correlations longer in some
 directions than others.
 
 \subsection{SPDE Operator and Precision Matrix}
+\label{sec:spde-op}
 
-The discretised SPDE operator is
+The matrix $K = \kappa^2 C + G$ is the FEM discretisation of the operator
+$(\kappa^2 - \Delta)$, as assembled in \eqref{eq:lhs}.
+
+\paragraph{Precision for $\alpha=1$.}
+From the Galerkin system \eqref{eq:galerkin-system}, $\mathbf{x}=K^{-1}\mathbf{z}$
+with $\mathbf{z}\sim\mathcal{N}(0,C)$, so the covariance of $\mathbf{x}$ is
+$K^{-1}CK^{-1}$ ($K$ is symmetric) and the precision is
 \begin{equation}
-  K = \kappa^2 C + G.
-  \label{eq:K}
+  Q_{\alpha=1} = K C^{-1} K.
+  \label{eq:Q1}
 \end{equation}
-For $\alpha=2$ the Galerkin approximation of the fractional operator
-$(\kappa^2-\Delta)^2$ yields the precision matrix
+
+\paragraph{Precision for $\alpha=2$.}
+The $\alpha=2$ SPDE $(\kappa^2-\Delta)^2 x = \mathcal{W}$ factors as two
+applications of $(\kappa^2-\Delta)$.  Applying the Galerkin discretisation
+twice gives the same form $Q = KC^{-1}K$, but $C^{-1}$ is dense (the inverse
+of a sparse matrix), making it expensive to work with.  Following
+\citet{lindgren2011}, we replace $C$ by the \emph{lumped} mass matrix
+$\tilde{C}=\diag(C\mathbf{1})$:
 \begin{equation}
-  Q = K \, \tilde{C}^{-1} \, K, \qquad \tilde{C} = \diag(C\mathbf{1}),
+  Q = K \, \tilde{C}^{-1} \, K.
   \label{eq:Q}
 \end{equation}
-where $\tilde{C}$ is the \emph{lumped} mass matrix.  Unlike the
-intrinsic GMRF (ICAR) commonly used in disease mapping, $Q$ is positive
-definite for any $\kappa > 0$, so the prior is proper.
+Because $\tilde{C}$ is diagonal, $\tilde{C}^{-1}$ costs nothing to apply.
+The substitution is a consistent approximation: $\tilde{C}\to C$ as the mesh
+refines (the lumped and consistent mass matrices converge).  The resulting $Q$
+is sparse --- its nonzero pattern is that of $K^2$ restricted to the mesh
+graph --- and positive definite for any $\kappa>0$, making the prior proper.
 
-For general smoothness order $\alpha \ge 1$,
+For general $\alpha\ge 1$,
 \begin{equation}
-  Q = K \bigl(\tilde{C}^{-1} K\bigr)^{\alpha-1}.
+  Q = K\bigl(\tilde{C}^{-1}K\bigr)^{\alpha-1}.
+  \label{eq:Q-general}
 \end{equation}
 
 % ============================================================
