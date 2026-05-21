@@ -154,42 +154,117 @@ the likelihood (Section~\ref{sec:obs-bounds}).
 \subsection{Basis Functions and Local Geometry}
 
 On the triangulation $\mathcal{T}$ with $m$ nodes and $T$ simplices, we use
-piecewise linear ``hat'' basis functions $\{\phi_i\}_{i=1}^m$.
-For simplex $\tau$ with vertices $v_0, \ldots, v_d$, the reference-to-physical
-map is
+piecewise linear \emph{hat} basis functions $\{\phi_i\}_{i=1}^m$.  The hat
+function $\phi_j$ equals 1 at node $j$, 0 at every other node, and varies
+linearly in between.  Within any single simplex it is a flat tilted plane, so
+its gradient is \emph{constant} on each simplex and can be computed from
+geometry alone.
+
+\paragraph{Reference simplex and the map $B_\tau$.}
+Every computation is carried out on a fixed \emph{reference simplex}
+$\hat\tau$ with vertices at the origin $\hat{v}_0=\mathbf{0}$ and the
+standard basis vectors $\hat{v}_k = e_k$ for $k=1,\ldots,d$.  On this
+template the hat functions are trivially
+\[
+  \hat\phi_0(\hat s) = 1 - \hat s_1 - \cdots - \hat s_d, \qquad
+  \hat\phi_k(\hat s) = \hat s_k \;\;(k\ge 1),
+\]
+with reference gradients $\nabla_{\hat s}\hat\phi_j = \hat{e}_j$, where
+$\hat{e}_0 = -\mathbf{1}$ and $\hat{e}_k$ is the $k$-th standard basis
+vector.
+
+The matrix
 \begin{equation}
-  B_\tau = [v_1 - v_0, \;\ldots\;, v_d - v_0] \in \R^{d\times d}.
+  B_\tau = [v_1 - v_0, \;\ldots\;, v_d - v_0] \in \R^{d\times d}
 \end{equation}
-The volume of simplex $\tau$ is $|\tau| = |\det B_\tau| / d!$, and the physical
-gradient of the $j$-th local basis function is
+maps the reference simplex to the physical simplex $\tau$ via
+$s = v_0 + B_\tau\hat s$.  Its columns are the edge vectors of $\tau$
+emanating from $v_0$, so $B_\tau$ encodes the shape and orientation of the
+triangle.  The volume follows immediately: $|\tau| = |\det B_\tau|/d!$.
+
+\paragraph{Why $B_\tau^{-\top}$ for gradients.}
+The gradient $\nabla_s\phi_j^{(\tau)}$ is the vector $g$ satisfying
+$g\cdot\delta s = \delta\phi$ for every physical displacement $\delta s$.
+Writing $\delta s = B_\tau\,\delta\hat s$ and using the reference gradient
+$\nabla_{\hat s}\hat\phi_j = \hat{e}_j$:
+\[
+  g \cdot B_\tau\,\delta\hat s
+  = \hat{e}_j \cdot \delta\hat s
+  \quad\text{for all }\delta\hat s,
+\]
+which gives $B_\tau^{\top}g = \hat{e}_j$, and therefore
 \begin{equation}
-  \nabla_s \phi_j^{(\tau)} = B_\tau^{-\top} \hat{e}_j, \quad j = 0, \ldots, d,
+  \nabla_s \phi_j^{(\tau)} = B_\tau^{-\top}\hat{e}_j, \quad j = 0, \ldots, d.
+  \label{eq:grad-phi}
 \end{equation}
-where $\hat{e}_0 = -\mathbf{1}$ and $\hat{e}_j$ is the $j$-th standard basis
-vector for $j \ge 1$.
+Intuitively, $B_\tau^{-1}$ converts a physical direction into reference
+coordinates, and the transpose accounts for the fact that gradients scale
+inversely with distances (a squeezed triangle has steeper slopes).  Because
+$B_\tau$ is constant on $\tau$, so is $\nabla_s\phi_j^{(\tau)}$: the hat
+function is a flat ramp, and \eqref{eq:grad-phi} gives its slope.
 
 \subsection{Mass Matrix}
 
-The global mass matrix $C \in \R^{m\times m}$ has entries
+The mass matrix $C \in \R^{m\times m}$ has entries
 \begin{equation}
   C_{ij} = \int_\mathcal{D} \phi_i(s)\phi_j(s) \dd s
          = \sum_{\tau \ni i,j} |\tau| \frac{1 + \delta_{ij}}{(d+1)(d+2)}.
   \label{eq:mass}
 \end{equation}
-The assembled $C$ is symmetric positive definite with a sparsity pattern
-matching the mesh topology.
+$C_{ij}$ measures the \emph{overlap} between hat functions $\phi_i$ and
+$\phi_j$: it is nonzero only when nodes $i$ and $j$ share at least one
+simplex.  The diagonal entry $C_{ii}$ is proportional to the total area of
+all simplices containing node $i$.  The matrix is symmetric positive definite
+with sparsity matching the mesh topology.
+
+The \emph{row sum} $\tilde{c}_j = (C\mathbf{1})_j = \sum_k C_{jk}$ is the
+total area ``owned'' by node $j$: it equals $\sum_{\tau\ni j}|\tau|/(d+1)$,
+the average share of each incident simplex.  Geometrically, $\tilde{c}_j$
+approximates the area of the Voronoi cell around node $j$.  The diagonal
+matrix $\tilde{C} = \diag(C\mathbf{1})$ is the \emph{lumped} mass matrix,
+used in Section~\ref{sec:integral-approx} to approximate the Poisson integral
+as a weighted sum $\sum_j \tilde{c}_j \lambda_j$.
+
+In the SPDE operator $(\kappa^2 - \Delta)$, the term $\kappa^2$ acts like a
+scalar multiple of the identity on functions.  After Galerkin projection onto
+the hat-function basis, this becomes $\kappa^2 C$: the mass matrix is the
+FEM discretisation of the identity operator, weighted by local area.
 
 \subsection{Stiffness Matrix}
 
-The isotropic stiffness matrix is
+The stiffness matrix $G \in \R^{m\times m}$ has entries
 \begin{equation}
   G_{ij} = \int_\mathcal{D} \nabla\phi_i(s) \cdot \nabla\phi_j(s) \dd s
          = \sum_{\tau \ni i,j} |\tau| \, \nabla\phi_i^{(\tau)} \cdot \nabla\phi_j^{(\tau)}.
   \label{eq:stiff}
 \end{equation}
+$G_{ij}$ measures how much nodes $i$ and $j$ \emph{resist spatial variation}
+together: it is the inner product of the slopes of the two hat functions.
+By integration by parts, $\mathbf{x}^T G\, \mathbf{x} =
+\int|\nabla x(s)|^2\dd s$, so the quadratic form in $G$ is exactly the total
+squared-gradient energy of the piecewise-linear field
+$x(s)=\sum_j x_j\phi_j(s)$.  Smooth fields (small gradients everywhere) have
+low $G$-energy; rough or wiggly fields have high $G$-energy.
+
+Equivalently, $G$ discretises the negative Laplacian $-\Delta$: it can be
+thought of as a network of \emph{springs} connecting adjacent nodes, where
+$G_{ij}$ is (minus) the spring constant for the edge between $i$ and $j$.
+For a Delaunay mesh in 2D, $G_{ij} \le 0$ for all neighbours
+($i\neq j$), and the action $(G\mathbf{x})_i = -\sum_j G_{ij}(x_j - x_i)$
+sums the spring forces pulling node $i$ toward its neighbours' values.
+
+Together, $K = \kappa^2 C + G$ discretises $(\kappa^2 - \Delta)$: the mass
+term $\kappa^2 C$ penalises large \emph{absolute} values of the field, and
+the stiffness term $G$ penalises spatial \emph{roughness}.  Large $\kappa$
+makes the mass term dominate, producing a field with short correlation length
+(rapidly decorrelated); small $\kappa$ lets the stiffness term dominate,
+producing a smoother field correlated over longer distances.
+
 For the generalised case \eqref{eq:spde-gen}, the integrand becomes
-$\nabla\phi_i^T H(\bar\tau) \nabla\phi_j$ where $H$ is evaluated at the simplex
-centroid $\bar\tau$.
+$\nabla\phi_i^T H(\bar\tau) \nabla\phi_j$ where $H$ is evaluated at the
+simplex centroid $\bar\tau$: the anisotropic diffusion tensor $H$ stretches
+the spring network directionally, making correlations longer in some
+directions than others.
 
 \subsection{SPDE Operator and Precision Matrix}
 
