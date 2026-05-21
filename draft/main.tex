@@ -220,7 +220,7 @@ with sparsity matching the mesh topology.
 The \emph{row sum} $\tilde{c}_j = (C\mathbf{1})_j = \sum_k C_{jk}$ is the
 total area ``owned'' by node $j$: it equals $\sum_{\tau\ni j}|\tau|/(d+1)$,
 the average share of each incident simplex.  Geometrically, $\tilde{c}_j$
-approximates the area of the Voronoi cell around node $j$.  The diagonal
+approximates the area of the Voronoi cell\footnote{It's not really a Voronoi cell, but it's close-ish to one depending on the triangulation.} around node $j$.  The diagonal
 matrix $\tilde{C} = \diag(C\mathbf{1})$ is the \emph{lumped} mass matrix,
 used in Section~\ref{sec:integral-approx} to approximate the Poisson integral
 as a weighted sum $\sum_j \tilde{c}_j \lambda_j$.
