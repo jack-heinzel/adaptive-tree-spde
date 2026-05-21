@@ -612,21 +612,18 @@ cancels exactly against the proposal density by the change-of-variables
 identity $q_*(x^*)\,|dx^*/du|^{-1}=\phi(u)$.)
 
 \paragraph{Simplification via conditional prior proposal.}
-Substituting $q_*(x^*)=p(\mathbf{x}_m,x^*\mid m')/p(\mathbf{x}_m\mid m')$ into \eqref{eq:rj-raw}:
-\begin{align}
+Substituting $q_*(x^*)=p(\mathbf{x}_m,x^*\mid m')/p(\mathbf{x}_m\mid m')$
+and cancelling common factors:
+\begin{equation}
   \frac{p(\mathbf{x}_m,x^*\mid m')}
        {q_*(x^*)\,p(\mathbf{x}_m\mid m)}
-  &= \frac{p(\mathbf{x}_m,x^*\mid m')}{p(\mathbf{x}_m\mid m')}\cdot
-     \frac{p(\mathbf{x}_m\mid m')}{p(\mathbf{x}_m\mid m)}
-     \cdot\frac{p(\mathbf{x}_m\mid m')}{p(\mathbf{x}_m,x^*\mid m')/p(\mathbf{x}_m\mid m')}
-     \nonumber \\[-6pt]
-  &= \frac{p(\mathbf{x}_m\mid m')}{p(\mathbf{x}_m\mid m)}, \nonumber
-\end{align}
+  = \frac{p(\mathbf{x}_m\mid m')}{p(\mathbf{x}_m\mid m)}
+  \;\eqqcolon\; \mathcal{R}_\mathrm{prior},
+\end{equation}
 so the acceptance ratio reduces to
 \begin{equation}
   \alpha_\mathrm{b} = \min\!\left(1,\;
-    \underbrace{\frac{p(\mathbf{x}_m\mid m',\kappa,\sigma)}
-                     {p(\mathbf{x}_m\mid m,\kappa,\sigma)}}_{\mathcal{R}_\mathrm{prior}}
+    \mathcal{R}_\mathrm{prior}
     \cdot
     \underbrace{\frac{L(m',\mathbf{x}_{m'},\mu)}
                      {L(m,\mathbf{x}_m,\mu)}}_{\mathcal{R}_L}
@@ -636,63 +633,66 @@ so the acceptance ratio reduces to
   \right).
   \label{eq:rj-acc}
 \end{equation}
-The proposal density $q_*$ does not appear in \eqref{eq:rj-acc}: the
-conditional-prior proposal absorbs the prior factor exactly, leaving only
-the ratio of \emph{marginal} prior densities on the old nodes.  The death
-move acceptance ratio is $\min(1,\alpha_\mathrm{b}^{-1})$.
+The death move acceptance ratio is $\min(1,\alpha_\mathrm{b}^{-1})$.
 
-\subsection{Marginal Prior Ratio}
+\subsection{Prior Consistency and the Approximation $\mathcal{R}_\mathrm{prior}\approx 1$}
 \label{sec:rj-prior}
 
-The marginal distribution of $\mathbf{x}_m$ under mesh $m'$ has precision equal
-to the Schur complement of $Q'$:
+The term $\mathcal{R}_\mathrm{prior} = p(\mathbf{x}_m\mid m')/p(\mathbf{x}_m\mid m)$
+compares the SPDE prior on the \emph{old} nodes under the two meshes.
+For a true Mat\'ern Gaussian process, this ratio equals 1 exactly: the GP
+consistency property guarantees that the marginal at any fixed set of
+locations is determined solely by the covariance function, independent of
+which additional locations are included in the model.
+
+For the \emph{FEM-discretised} prior, however, $\mathcal{R}_\mathrm{prior}\neq 1$
+in general.  Splitting $\tau^*$ modifies the piecewise-linear basis functions
+at $v_0,v_1,v_2$: the stiffness and mass integrals over the former $\tau^*$
+are replaced by integrals over three smaller triangles, so $Q'_{-*}\neq Q$ and
+the Schur complement $Q'_\mathrm{SC} \neq Q$.  The discrepancy is
 \begin{equation}
-  Q'_\mathrm{SC}
-  = Q'_{-*} - \frac{(Q'_{*-})^T Q'_{*-}}{Q'_{**}},
-  \label{eq:schur}
+  Q'_\mathrm{SC} - Q \;=\;
+  \underbrace{(Q'_{-*} - Q)}_{\text{FEM change at }v_0,v_1,v_2}
+  - \frac{(Q'_{*-})^T Q'_{*-}}{Q'_{**}},
+  \label{eq:SC-diff}
 \end{equation}
-so $p(\mathbf{x}_m\mid m')=\mathcal{N}(\mathbf{x}_m;0,\sigma^2 Q_\mathrm{SC}'^{-1})$.
-Using the block determinant identity $|Q'|=Q'_{**}\cdot|Q'_\mathrm{SC}|$:
+which has nonzeros only in rows/columns $\{v_0,v_1,v_2\}$ and their
+2-hop neighbours.  Both terms scale with the area $|\tau^*|$ of the split
+triangle, so $\|Q'_\mathrm{SC}-Q\|=O(|\tau^*|)$ and
+$\log\mathcal{R}_\mathrm{prior}=O(|\tau^*|^2)$.  Finer triangles produce
+smaller corrections, and the correction vanishes in the mesh-refinement limit
+as the FEM prior converges to the true Matérn GP.
+
+We therefore adopt the approximation
 \begin{equation}
-  \log\mathcal{R}_\mathrm{prior}
-  = \underbrace{\tfrac{1}{2}\log\!\frac{|Q'|}{Q'_{**}\,|Q|}}_{\text{log-det term}}
-    - \underbrace{\frac{\mathbf{x}_m^T(Q'_\mathrm{SC}-Q)\,\mathbf{x}_m}{2\sigma^2}}_{\text{quadratic term}}.
-  \label{eq:log-R-prior}
+  \mathcal{R}_\mathrm{prior} \approx 1,
+  \label{eq:Rprior-approx}
+\end{equation}
+which is exact for the true GP prior and is a consistent approximation for
+the FEM prior.  The acceptance ratio simplifies to
+\begin{equation}
+  \boxed{
+  \alpha_\mathrm{b} = \min\!\left(1,\;
+    \underbrace{\frac{L(m',\mathbf{x}_{m'},\mu)}
+                     {L(m,\mathbf{x}_m,\mu)}}_{\mathcal{R}_L}
+    \cdot
+    \underbrace{\frac{p(m')}{p(m)}}_{\mathcal{R}_m}
+    \cdot\frac{q_d\,N_m}{q_b\,M_{m'}}
+  \right).}
+  \label{eq:rj-acc-simple}
 \end{equation}
 
-\paragraph{Quadratic term.}
-Writing $Q'_{*-}\mathbf{x}_m = -Q'_{**}\bar{x}^*$ (from \eqref{eq:cond-prior-rj}):
-\begin{equation}
-  \mathbf{x}_m^T Q'_\mathrm{SC}\,\mathbf{x}_m
-  = \mathbf{x}_m^T Q'_{-*}\,\mathbf{x}_m - Q'_{**}(\bar{x}^*)^2.
-  \label{eq:quad-SC}
-\end{equation}
-The matrix $Q'_{-*}-Q$ has nonzero entries only in rows and columns
-$\{v_0,v_1,v_2\}$ (FEM entries change only within the split triangle), so
-the quadratic form $\mathbf{x}_m^T(Q'_\mathrm{SC}-Q)\mathbf{x}_m$ is an
-$O(1)$ local computation.
-
-\paragraph{Log-determinant term.}
-Writing $|Q'|/|Q| = |K'|^2|\tilde{C}|\,/\,(|K|^2|\tilde{C}'|)$, the
-lumped-mass ratio $|\tilde{C}'|/|\tilde{C}|=\tilde{c}'_*\prod_{i}(\tilde{c}'_{v_i}/\tilde{c}_{v_i})$
-is a product of $O(1)$ scalars.  For the stiffness ratio, denote the change to
-the existing nodes' block as $\delta K = K'_{-*}-K$ (nonzeros in rows/cols
-$\{v_0,v_1,v_2\}$ only).  Writing $\delta K = E\,\Delta_3\,E^T$ where
-$E\in\R^{n_m\times 3}$ selects the columns for $\{v_0,v_1,v_2\}$, the
-matrix determinant lemma gives
-\begin{equation}
-  \log\frac{|K'_{-*}|}{|K|}
-  = \log\bigl|I_3 + \Delta_3\,(E^T K^{-1} E)\bigr|,
-  \label{eq:MDL-K}
-\end{equation}
-requiring three linear solves with $K$.  The $**$ Schur complement of $K'$
-then contributes an additional scalar log-term:
-\begin{equation}
-  \log|K'| = \log|K'_{-*}| + \log\!\left(k'_{**} - (\delta k_{*-})^T(K'_{-*})^{-1}\delta k_{*-}\right),
-  \label{eq:K-full-det}
-\end{equation}
-where $\delta k_{*-}\in\R^{n_m}$ is the new $*$-column of $K'$ (nonzero only
-at $v_0,v_1,v_2$), computable with one further sparse solve.
+\begin{remark}[Exact cancellation via GP prior]
+$\mathcal{R}_\mathrm{prior}=1$ holds \emph{exactly} if the prior on every mesh
+is defined by the Mat\'ern covariance function directly---i.e.\
+$p(\mathbf{x}_m\mid m,\kappa,\sigma)=\mathcal{N}(0,\Sigma_m)$ with
+$\Sigma_{ij}=\sigma^2 C_\nu(s_i,s_j;\kappa)$---rather than by the FEM
+precision.  In that case the proposal \eqref{eq:cond-prior-rj} becomes the
+kriging predictor under the Mat\'ern covariance, replacing the local FEM
+formula with a dense covariance solve.  The FEM approximation is then used
+only for the likelihood (lumped-mass quadrature and barycentric interpolation),
+not for the prior.
+\end{remark}
 
 \subsection{Likelihood Ratio}
 \label{sec:rj-ll}
