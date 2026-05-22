@@ -749,7 +749,7 @@ three new triangles; their evaluation is an $O(1)$ local computation.
 \label{sec:rj-acceptance}
 
 We propose $x^*$ from the conditional prior $q_*(x^*)=p(x^*\mid\mathbf{x}_m,m',\kappa,\sigma)$.
-The standard Green (1995) acceptance ratio for the birth move is
+The standard \citet{green1995} acceptance ratio for the birth move is
 \begin{equation}
   \alpha_\mathrm{b} = \min\!\left(1,\;
     \frac{\pi(m',\,\mathbf{x}_{m'})}
@@ -873,6 +873,219 @@ A natural choice is a geometric prior on the number of leaf triangles:
 where $N_0$ is the initial triangle count and $\rho$ controls the expected
 depth of refinement.  Under \eqref{eq:mesh-prior}, $\mathcal{R}_m=\rho^2$
 for every birth move (two new leaves added).
+
+% ============================================================
+\section{Infinite-Dimensional Sampling Methods}
+\label{sec:inf-dim-samplers}
+% ============================================================
+
+The RJMCMC scheme of Section~\ref{sec:rjmcmc} handles the \emph{transdimensional}
+part of the posterior — deciding how many mesh nodes to use.  Within a fixed mesh,
+however, we still need to sample the field values $x \in \mathbb{R}^N$.  This
+section explains why the obvious choices (random-walk MH, vanilla HMC) become
+increasingly expensive as $N$ grows, and introduces two \emph{dimension-robust}
+alternatives that are designed from the start to work on function space.
+
+\subsection{The Curse of Discretisation}
+\label{sec:curse-disc}
+
+Fix a prior $x \sim \mathcal{N}(0, Q^{-1})$ with precision $Q \in \mathbb{R}^{N\times N}$.
+As the mesh is refined, $N\to\infty$, and the field $x$ converges to a genuine
+Gaussian process.  Standard samplers degrade:
+
+\begin{itemize}
+  \item \textbf{Random-walk MH} with isotropic proposal variance $h^2 I$:
+        the optimal acceptance rate requires $h = O(N^{-1/2})$, so the chain
+        makes $O(N)$ steps to move $O(1)$ in function space — cost $O(N)$ per
+        independent sample.
+  \item \textbf{Vanilla HMC} (mass matrix $M = I$): the leapfrog step size must
+        satisfy $\varepsilon = O(N^{-1/4})$ to keep $|\Delta H|$ bounded, so
+        $O(N^{1/4})$ steps per proposal and $O(N^{1/4})$ gradient evaluations,
+        giving $O(N^{5/4})$ cost per independent sample.
+\end{itemize}
+
+The root cause is the same in both cases: the proposal ignores the prior geometry,
+so the acceptance probability collapses in high dimensions.  The fix is to build
+the prior covariance $Q^{-1}$ directly into the proposal.
+
+\subsection{Preconditioned Crank--Nicolson (pCN)}
+\label{sec:pcn}
+
+\paragraph{Proposal.}
+For a target $\pi(x) \propto L(x)\,\mathcal{N}(x;\,0,Q^{-1})$, define:
+\begin{equation}
+  x' = \sqrt{1-\beta^2}\,x + \beta\,\xi, \qquad \xi \sim \mathcal{N}(0, Q^{-1}),
+  \label{eq:pcn-proposal}
+\end{equation}
+where $\beta \in (0,1]$ is a step-size parameter.
+
+\paragraph{Why it works.}
+The Crank--Nicolson interpolation \eqref{eq:pcn-proposal} exactly preserves
+$\mathcal{N}(0, Q^{-1})$: if $x$ is distributed as the prior, so is $x'$.
+Consequently, the prior log-density cancels in the Metropolis--Hastings ratio and
+only the likelihood ratio survives:
+\begin{equation}
+  \alpha(x, x') = \min\!\left(1,\, \frac{L(x')}{L(x)}\right).
+  \label{eq:pcn-alpha}
+\end{equation}
+The acceptance rate therefore depends only on $L$, not on $N$: choosing $\beta$
+once for a coarse mesh yields the same acceptance on a fine mesh.  This
+\emph{dimension-robustness} is the defining property of pCN
+\citep{cotter2013}.
+
+\paragraph{Implementation.}
+Sampling $\xi \sim \mathcal{N}(0, Q^{-1})$ amounts to solving the sparse linear
+system $Q\,\xi = z$ for $z \sim \mathcal{N}(0,I)$, which can be done with
+conjugate gradient (CG) in $O(N)$ time for a graph-Laplacian precision (see
+Section~\ref{sec:cg}).
+
+\subsection{Hilbert-Space HMC}
+\label{sec:hilbert-hmc}
+
+pCN is robust but uses only first-order (likelihood evaluation) information.
+Hilbert-space HMC incorporates gradient information while retaining
+dimension-robustness \citep{beskos2011}.
+
+\paragraph{Velocity parameterisation.}
+Standard HMC introduces a momentum $p \sim \mathcal{N}(0, M)$ and
+Hamiltonians $H = U(x) + \tfrac{1}{2}p^\top M^{-1} p$.  Setting $M = Q$
+and changing variables to $v = Q^{-1}p$ (so $v \sim \mathcal{N}(0, Q^{-1})$):
+\begin{align}
+  H(x,v) &= U(x) + K(v), \\
+  U(x)   &= -\log L(x) + \tfrac{1}{2} x^\top Q x, \label{eq:hmc-U}\\
+  K(v)   &= \tfrac{1}{2} v^\top Q v. \label{eq:hmc-K}
+\end{align}
+Hamilton's equations become $\dot{x} = v$ and $Q\dot{v} = -\nabla U(x)$.
+
+\paragraph{Leapfrog integrator.}
+With step size $\varepsilon$ and $L$ leapfrog steps:
+\begin{align}
+  v &\leftarrow v - \tfrac{\varepsilon}{2}\, Q^{-1}\nabla U(x) \tag{half kick}\\
+  \text{for } & i = 1,\ldots, L-1: \notag\\
+  & x \leftarrow x + \varepsilon\, v \tag{drift}\\
+  & v \leftarrow v - \varepsilon\, Q^{-1}\nabla U(x) \tag{full kick}\\
+  x &\leftarrow x + \varepsilon\, v \tag{final drift}\\
+  v &\leftarrow v - \tfrac{\varepsilon}{2}\, Q^{-1}\nabla U(x). \tag{final half kick}
+\end{align}
+Each ``kick'' requires one solve $Q^{-1}b$; each drift requires only a
+vector addition.  The kinetic energy $K(v) = \tfrac{1}{2}v^\top Qv$ needs only
+a matrix–vector product $Qv$, not a solve.
+
+\paragraph{Why the velocity form is preferable.}
+Three advantages over the standard $(x, p)$ form with $M = Q$:
+\begin{enumerate}
+  \item $K(v) = \tfrac{1}{2}v^\top Qv$ — computed with one sparse mat-vec, no
+        matrix inverse.
+  \item Velocity refresh $v \sim \mathcal{N}(0, Q^{-1})$ uses \emph{exactly} the same
+        CG solve as prior sampling — no Cholesky, no dense matrix stored.
+  \item All $O(N^2)$--$O(N^3)$ dense-algebra is replaced by $O(N \times
+        \text{CG iters})$ sparse work.
+\end{enumerate}
+
+\paragraph{Dimension-robustness.}
+With $M = Q$, the leapfrog step size can be chosen independently of $N$ (the
+eigenmodes of $Q$ all enter the dynamics on the same footing).  In practice
+one observes $|\Delta H| = O(1)$ and acceptance $\approx 65$--$80\,\%$ regardless
+of mesh size, provided $\varepsilon$ is tuned on a coarse mesh \citep{beskos2011,
+hairer2014}.
+
+\paragraph{CG for $Q^{-1}b$.}
+\label{sec:cg}
+For the Besag CAR prior $Q = \kappa^2 I + L_{\rm graph}$, where $L_{\rm graph}$
+is the graph Laplacian of the mesh connectivity, the condition number satisfies
+\begin{equation}
+  \kappa(Q) = \frac{\kappa^2 + \lambda_{\max}(L_{\rm graph})}{\kappa^2}
+            \approx \frac{\kappa^2 + 8}{\kappa^2}
+\end{equation}
+for a 4-connected grid (eigenvalues of $L_{\rm graph}$ lie in $[0,8]$).  This is
+\emph{independent of $N$}, so CG converges in $O(1)$ iterations and each leapfrog
+step costs $O(N)$.  For the FEM precision matrix derived from the SPDE operator
+(Section~\ref{sec:precision}), the same argument holds with $\kappa^2$
+replacing 8 as the dominant eigenvalue bound.
+
+\subsection{Combining Hilbert-Space HMC with RJMCMC}
+\label{sec:rjmcmc-hmc}
+
+The overall algorithm separates into two nested move types:
+
+\begin{description}
+  \item[\textbf{Within-model move}] (fixed $N_m$): one Hilbert-space HMC step in
+    $(x, v)$ space.  Gradient information from the likelihood accelerates mixing;
+    the $Q$-preconditioned leapfrog keeps $\varepsilon$ mesh-size-independent.
+  \item[\textbf{Transdimensional move}] (birth or death): one RJMCMC step as in
+    Section~\ref{sec:rjmcmc}.  On acceptance, the field $x$ and precision $Q$
+    change dimension.  The velocity $v$ is refreshed by drawing
+    $v_{\rm new} \sim \mathcal{N}(0, Q_{\rm new}^{-1})$
+    (one CG solve in the new space) before the next HMC step.
+\end{description}
+
+\begin{algorithm}[H]
+\caption{Joint RJMCMC + Hilbert-Space HMC}
+\label{alg:rj-hmc}
+\begin{algorithmic}[1]
+  \State \textbf{Initialise:} mesh $\mathcal{T}_0$, $x^{(0)} \sim \mathcal{N}(0, Q_0^{-1})$,
+         $v^{(0)} \sim \mathcal{N}(0, Q_0^{-1})$
+  \For{$t = 1, 2, \ldots$}
+    \State Draw $u \sim \mathrm{Uniform}(0,1)$
+    \If{$u < p_{\rm trans}$}  \Comment{transdimensional move}
+      \State Propose birth/death $(\mathcal{T}, x) \to (\mathcal{T}', x')$ \hfill (Section~\ref{sec:rjmcmc})
+      \State Accept with probability $\min(1,\, \mathcal{R}_L \cdot \mathcal{R}_m \cdot \mathcal{R}_J)$
+      \If{accepted}
+        \State $v \leftarrow Q'^{-1} z$, \;$z \sim \mathcal{N}(0, I)$
+        \hfill (velocity refresh via CG)
+      \EndIf
+    \Else \Comment{within-model move}
+      \State $v \leftarrow Q^{-1}z$, \;$z \sim \mathcal{N}(0, I)$
+            \hfill (velocity refresh)
+      \State Run $L$-step leapfrog to propose $(x', v')$
+      \State Accept with probability $\min(1,\, e^{-\Delta H})$
+    \EndIf
+  \EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\noindent
+The mixing-time scales of the two move types are naturally separated: HMC
+explores the field posterior quickly (correlated draws in $O(1)$ steps) while
+RJMCMC explores mesh complexity slowly (each birth/death requires a Jacobian
+factor).  The fraction $p_{\rm trans}$ controls the trade-off; a common heuristic
+is $p_{\rm trans} \approx 0.1$.
+
+\subsection{Annotated Reading List}
+\label{sec:reading-list}
+
+\begin{description}
+  \item[\citet{stuart2010}] The foundational reference for Bayesian inversion on
+    function space.  Section 4 defines Gaussian priors on Hilbert spaces and makes
+    precise what it means for a posterior to be well-posed in infinite dimensions.
+    Read this first to understand \emph{why} dimension-robustness is the right
+    criterion.
+
+  \item[\citet{cotter2013}] Derives pCN and its acceptance formula \eqref{eq:pcn-alpha},
+    proves dimension-robustness, and compares it to a function-space version of
+    the Langevin algorithm (MALA).  Includes numerical experiments on an elliptic
+    inverse problem showing acceptance rates stable as $N \to \infty$.
+
+  \item[\citet{beskos2011}] Introduces the Hilbert-space HMC (called ``Hybrid Monte
+    Carlo on Hilbert spaces'').  Proves that with the prior as mass matrix the
+    step size can be held fixed as $N \to \infty$ and that the acceptance
+    probability remains bounded away from zero.  The velocity parameterisation
+    used here follows their exposition.
+
+  \item[\citet{hairer2014}] Provides spectral-gap bounds for pCN and related
+    infinite-dimensional Metropolis algorithms, giving a rigorous convergence rate
+    in terms of the likelihood Lipschitz constant.  Useful background if you want
+    to understand \emph{how fast} the chain mixes in theory.
+
+  \item[\citet{neal2011}] The standard handbook chapter on HMC; covers the
+    leapfrog integrator, step-size tuning, and the dual-averaging adaptation used
+    in NUTS.  Read before \citet{beskos2011} to understand the finite-dimensional
+    version.
+
+  \item[\citet{green1995}] Original RJMCMC paper.  Introduces the general
+    reversible-jump framework and the Jacobian term $\mathcal{R}_J$; the birth/death
+    moves of Section~\ref{sec:rjmcmc} are a special case.
+\end{description}
 
 % ============================================================
 \section{Implementation Summary}
