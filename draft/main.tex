@@ -118,6 +118,7 @@ parameter $\sigma$ (Section~\ref{sec:hyperparams}) is therefore essential.
 
 % ============================================================
 \section{Adaptive Triangulation}
+\label{sec:adaptive-tri}
 % ============================================================
 
 \subsection{Recursive Equal-Count kd-Tree}
@@ -875,6 +876,287 @@ A natural choice is a geometric prior on the number of leaf triangles:
 where $N_0$ is the initial triangle count and $\rho$ controls the expected
 depth of refinement.  Under \eqref{eq:mesh-prior}, $\mathcal{R}_m=\rho^2$
 for every birth move (two new leaves added).
+
+% ============================================================
+\section{Adaptive Hat-Function Tree Basis}
+\label{sec:hat-tree}
+% ============================================================
+
+We replace the Delaunay triangulation of Section~\ref{sec:adaptive-tri} with a
+tree-structured partition of axis-aligned rectangular cells and an associated
+multilinear hat-function basis.  Three properties make this choice appealing:
+(i) no triangulation algorithm is required;
+(ii) the FEM mass and stiffness matrices admit exact closed-form, diagonal
+     expressions;
+(iii) birth and death moves update the matrices via $O(D)$ arithmetic on the
+     widths of the two new cells, with no matrix reassembly.
+
+\subsection{Tree and Basis Functions}
+\label{sec:hat-basis}
+
+Let $\mathcal{D} = \prod_{d=1}^D [L_d, U_d]$ be the domain.  A
+\emph{rectangular cell} is an axis-aligned box
+$B_k = \prod_{d=1}^D [lo_d^{(k)}, hi_d^{(k)}]$, with cell widths
+$w_d^{(k)} = hi_d^{(k)} - lo_d^{(k)}$, cell volume
+$V_k = \prod_{d=1}^D w_d^{(k)}$, and centre
+$c_d^{(k)} = (lo_d^{(k)} + hi_d^{(k)})/2$.
+
+The \emph{one-dimensional hat function} on $[lo, hi]$ (width $w = hi - lo$,
+midpoint $m = lo + w/2$) is
+\begin{equation}
+  \hat(x;\,lo, hi) =
+  \begin{cases}
+    0                     & x \notin [lo,\,hi], \\
+    2(x - lo)/w           & x \in [lo,\;m], \\
+    2(hi - x)/w           & x \in [m,\;hi].
+  \end{cases}
+  \label{eq:hat1d}
+\end{equation}
+It equals 1 at the midpoint $m$, decays piecewise linearly to 0 at $lo$ and
+$hi$, and is zero outside $[lo, hi]$.  The \emph{multilinear hat function}
+for cell $B_k$ is the product
+\begin{equation}
+  \phi_k(x) = \prod_{d=1}^D \hat(x_d;\;lo_d^{(k)},\,hi_d^{(k)}),
+  \quad x \in \mathcal{D}.
+  \label{eq:hat-D}
+\end{equation}
+$\phi_k$ equals 1 at the cell centre $c^{(k)}$, decays linearly to 0 on
+every face of $B_k$, and is strictly zero outside $B_k$.  The \emph{support}
+of $\phi_k$ is exactly the closed box $B_k$.
+
+\paragraph{Tree structure.}
+The cells are nodes of a rooted binary tree $\mathcal{T}$ with
+$B_{\rm root} = \mathcal{D}$.  A \emph{birth move} on a leaf cell $B_k$ in
+dimension $d_0$ replaces $B_k$ with two children:
+\begin{equation}
+  B_{k_L} = B_k \text{ with } hi_{d_0} \mapsto c_{d_0}^{(k)},
+  \qquad
+  B_{k_R} = B_k \text{ with } lo_{d_0} \mapsto c_{d_0}^{(k)},
+  \label{eq:birth-cells}
+\end{equation}
+both children inheriting the intervals of $B_k$ in all other $D-1$
+dimensions.  A \emph{death move} merges two leaf siblings back into their
+parent.  The \emph{active basis} $\{\phi_k\}$ consists of all leaf cells.
+
+\subsection{Disjoint Supports}
+\label{sec:disjoint-supports}
+
+\begin{proposition}[Leaves partition the domain]
+  Any two distinct leaf cells $B_i$ and $B_j$ have disjoint interiors:
+  $\operatorname{int}(B_i) \cap \operatorname{int}(B_j) = \emptyset$.
+\end{proposition}
+\begin{proof}
+Every cell interval in each dimension is a dyadic interval
+$[p/2^n,\,(p+1)/2^n]$ for non-negative integers $p, n$.  Two dyadic intervals
+are either identical, nested (one strictly contains the other), or have
+disjoint interiors.  If $B_i \subsetneq B_j$ then $j$ is a strict ancestor of
+$i$ in the tree, so $j$ has at least one child and is \emph{not} a leaf ---
+contradiction.  By symmetry, $B_j \not\subsetneq B_i$.  Since they cannot be
+identical ($i \neq j$) and are not nested, their intervals in at least one
+dimension have disjoint interiors, making $\operatorname{int}(B_i) \cap
+\operatorname{int}(B_j) = \emptyset$.
+\end{proof}
+
+\noindent
+\textbf{Consequence.}  For any two distinct leaves $i \neq j$ and any
+integrable functions $f, g$ supported on $B_i$ and $B_j$ respectively,
+$\int_{\mathcal{D}} f\,g \dd x = 0$.  In particular:
+\begin{itemize}
+  \item $\int \phi_i \phi_j = 0$: the mass matrix is diagonal.
+  \item $\int \nabla\phi_i \cdot \nabla\phi_j = 0$: the stiffness matrix is
+        diagonal.
+\end{itemize}
+Both matrices are therefore computed \emph{node by node} with no off-diagonal
+coupling.
+
+\subsection{Mass Matrix}
+\label{sec:hat-mass}
+
+The mass matrix $C \in \R^{N \times N}$ (where $N = |\text{leaves}|$) has
+entries $C_{ij} = \int_{\mathcal{D}} \phi_i \phi_j \dd x$.
+
+\begin{proposition}[Closed-form mass matrix]
+\label{prop:mass}
+\begin{equation}
+  C = \frac{1}{3^D}\,\diag(V_1, \ldots, V_N),
+  \label{eq:hat-mass}
+\end{equation}
+where $V_k = \prod_{d=1}^D w_d^{(k)}$ is the volume of cell $B_k$.
+\end{proposition}
+\begin{proof}
+Off-diagonal entries vanish by disjoint supports.  For the diagonal, the
+product structure of $\phi_k$ and the independence of the integration
+variables give
+\[
+  C_{kk} = \int_{B_k} \phi_k(x)^2 \dd x
+          = \prod_{d=1}^D \int_{lo_d^{(k)}}^{hi_d^{(k)}}
+            \hat(x_d;\,lo_d^{(k)},\,hi_d^{(k)})^2 \dd x_d.
+\]
+Substituting $t = (x_d - lo)/w_d$ (so $\dd x_d = w_d\,\dd t$) and using the
+normalised hat $f(t) = 2t\cdot\mathbf{1}_{t \le 1/2} + 2(1-t)\cdot\mathbf{1}_{t >1/2}$:
+\[
+  \int_{lo}^{hi} \hat^2 \dd x
+  = w \int_0^1 f(t)^2 \dd t
+  = w \Bigl(4\!\int_0^{1/2} t^2 \dd t
+          + 4\!\int_{1/2}^1 (1-t)^2 \dd t\Bigr)
+  = w \cdot \frac{1}{3}.
+\]
+Taking the product over $d = 1,\ldots, D$ gives $C_{kk} = V_k / 3^D$.
+\end{proof}
+
+\begin{remark}[Lumped mass equals consistent mass]
+Since $C$ is diagonal, the lumped mass matrix $\tilde C = \diag(C \mathbf{1})$
+satisfies $\tilde{C} = C$ exactly.  The approximation $C \approx \tilde C$
+used in the triangulation-based FEM (Section~\ref{sec:stiffness}) is here
+an \emph{identity}, not an approximation.
+\end{remark}
+
+\subsection{Stiffness Matrix}
+\label{sec:hat-stiffness}
+
+The stiffness matrix $G \in \R^{N \times N}$ has entries
+$G_{ij} = \int_{\mathcal{D}} \nabla\phi_i \cdot \nabla\phi_j \dd x$.
+
+\begin{proposition}[Closed-form stiffness matrix]
+\label{prop:stiffness}
+\begin{equation}
+  G = \frac{4}{3^{D-1}} \diag\!\left(
+      V_k \sum_{d=1}^D \frac{1}{(w_d^{(k)})^2}
+      \right)_{k=1}^N.
+  \label{eq:hat-stiffness}
+\end{equation}
+\end{proposition}
+\begin{proof}
+Off-diagonal entries vanish by disjoint supports.  For the diagonal, write
+the gradient in dimension $d$:
+\[
+  \frac{\partial \phi_k}{\partial x_d}(x)
+  = \hat'(x_d;\,lo_d^{(k)},\,hi_d^{(k)})
+    \prod_{d' \neq d} \hat(x_{d'};\,lo_{d'}^{(k)},\,hi_{d'}^{(k)}),
+\]
+where $\hat'(x;\,lo,hi) = +2/w$ for $x \in (lo, m)$ and $-2/w$ for
+$x \in (m, hi)$.  Squaring and integrating, and using independence of
+dimensions:
+\begin{align*}
+  G_{kk}
+  &= \sum_{d=1}^D
+     \underbrace{\int_{lo_d}^{hi_d} [\hat'(x_d)]^2 \dd x_d}_{4/w_d^{(k)}}
+     \prod_{d' \neq d}
+     \underbrace{\int_{lo_{d'}}^{hi_{d'}} \hat(x_{d'})^2 \dd x_{d'}}_{w_{d'}^{(k)}/3} \\
+  &= \sum_{d=1}^D \frac{4}{w_d^{(k)}} \cdot \frac{V_k}{3^{D-1}\,w_d^{(k)}}
+   = \frac{4 V_k}{3^{D-1}} \sum_{d=1}^D \frac{1}{(w_d^{(k)})^2}.
+\end{align*}
+where the 1-D derivative self-overlap follows from $\int_0^1 (f')^2 dt = 4$,
+giving $\int_{lo}^{hi} (\hat')^2 \dd x = 4/w$.
+\end{proof}
+
+\noindent
+Combining \eqref{eq:hat-mass} and \eqref{eq:hat-stiffness}, the two scalar
+entries per leaf are related by
+\begin{equation}
+  G_{kk} = 12\, C_{kk} \sum_{d=1}^D \frac{1}{(w_d^{(k)})^2}.
+  \label{eq:GC-ratio}
+\end{equation}
+For an isotropic cell with equal widths $w_d^{(k)} = h$ in all dimensions,
+$G_{kk} = 12D\,C_{kk}/h^2$.  The stiffness entry grows as $h^{-2}$ as the
+cell shrinks, penalising large coefficients at fine scales in proportion to
+the cell's inverse squared width — the discrete analogue of the Laplacian's
+sensitivity to rapid variation.
+
+\subsection{Block Structure from Tree Hierarchy}
+\label{sec:hat-block}
+
+\paragraph{Recursive block decomposition.}
+Let $\mathcal{L}(k)$ denote the leaf set of the subtree rooted at internal
+node $k$, and write $C^{(k)}$, $G^{(k)}$ for the submatrices restricted to
+$\mathcal{L}(k)$.  Sorting leaves left-before-right at each internal node
+yields the recursive block structure
+\begin{equation}
+  C^{(k)} = C^{(k_L)} \oplus C^{(k_R)},
+  \qquad
+  G^{(k)} = G^{(k_L)} \oplus G^{(k_R)},
+  \label{eq:block-decomp}
+\end{equation}
+where $\oplus$ denotes the direct sum (block-diagonal stacking).  Applying
+\eqref{eq:block-decomp} recursively, the full matrices decompose into
+$N$ scalar blocks --- one per leaf --- determined solely by the cell volumes
+and widths.
+
+\paragraph{Birth-move update.}
+A birth in dimension $d_0$ on leaf $k$ replaces the $1\times 1$ scalar
+blocks $[C_{kk}]$ and $[G_{kk}]$ with $2\times 2$ diagonal blocks.
+Because $V_{k_L} = V_{k_R} = V_k/2$ and $w_{d_0}^{(k_{L/R})} = w_{d_0}^{(k)}/2$
+while $w_{d'}^{(k_{L/R})} = w_{d'}^{(k)}$ for $d' \neq d_0$, the four new
+scalars follow from \eqref{eq:hat-mass}--\eqref{eq:hat-stiffness}:
+\begin{align}
+  C_{k_L k_L} = C_{k_R k_R} &= \tfrac{1}{2} C_{kk},
+  \label{eq:birth-C} \\
+  G_{k_{L/R}\, k_{L/R}} &=
+    \frac{2V_k}{3^{D-1}}
+    \left[\frac{4}{(w_{d_0}^{(k)})^2}
+          + \sum_{d \neq d_0} \frac{1}{(w_d^{(k)})^2}\right].
+  \label{eq:birth-G}
+\end{align}
+A death move is the exact reverse: the two child scalars are discarded and
+the parent scalars are restored.  No global matrix reassembly is ever needed.
+
+\subsection{SPDE Operator and Diagonal Prior}
+\label{sec:hat-spde}
+
+The FEM discretisation of $(\kappa^2 - \Delta)$ is $K = \kappa^2 C + G$,
+diagonal with entries
+\begin{equation}
+  K_{kk} = \frac{V_k}{3^{D-1}}\left(\frac{\kappa^2}{3}
+            + 4\sum_{d=1}^D \frac{1}{(w_d^{(k)})^2}\right).
+  \label{eq:hat-K}
+\end{equation}
+Since $\tilde C = C$ exactly, the $\alpha = 2$ SPDE precision
+\eqref{eq:Q} is also diagonal:
+\begin{equation}
+  Q_{kk} = \frac{K_{kk}^2}{C_{kk}}
+  = \frac{3^D V_k}{3^{2(D-1)}}
+    \left(\frac{\kappa^2}{3} + 4\sum_{d=1}^D \frac{1}{(w_d^{(k)})^2}\right)^{\!2}
+  = \frac{V_k}{3^{D-2}}
+    \left(\frac{\kappa^2}{3} + 4\sum_{d=1}^D \frac{1}{(w_d^{(k)})^2}\right)^{\!2}.
+  \label{eq:hat-Q}
+\end{equation}
+The field prior $r \sim \mathcal{N}(0,\,\sigma^2 Q^{-1})$ therefore
+factorises over leaves: $r_k \sim \mathcal{N}(0,\,\sigma^2/Q_{kk})$
+independently.  The prior variance $\sigma^2/Q_{kk}$ decreases as the cell
+shrinks (finer cells carry less prior uncertainty), and increases with the
+range parameter via the $\kappa^2/3$ term.
+
+\paragraph{Log-determinant.}
+Because $Q$ is diagonal, $\log|Q| = \sum_k \log Q_{kk}$ is a trivial sum
+over leaves, updated in $O(D)$ arithmetic at each birth or death move.  No
+eigendecomposition is required.
+
+\subsection{Likelihood Discretisation}
+\label{sec:hat-like}
+
+The field approximation is $x(s) = \sum_{k\in\mathcal{L}} r_k\,\phi_k(s)$.
+Since the leaf cells partition $\mathcal{D}$, for any point $s$ there is
+a unique leaf $k(s)$ with $s \in B_{k(s)}$; all other $\phi_j(s)$ are zero.
+The log-intensity at an observed point $s_i$ is therefore
+\begin{equation}
+  \log\lambda(s_i) = \mu + r_{k(s_i)}\,\phi_{k(s_i)}(s_i),
+  \label{eq:hat-loglik-pt}
+\end{equation}
+a single multiply (no barycentric solve).
+
+For the integral term, note that for a fixed cell $k$ the integrand
+$e^{\mu + r_k \phi_k(s)}$ is not constant over $B_k$.  Using the
+centre-point approximation $\phi_k(c^{(k)}) = 1$:
+\begin{equation}
+  \int_{B_k} e^{\mu + r_k \phi_k(s)} \dd s \approx V_k\, e^{\mu + r_k},
+  \label{eq:hat-integral-approx}
+\end{equation}
+so the Poisson integral becomes $\sum_k V_k e^{\mu + r_k}$.  This is
+identical in form to the lumped-mass quadrature
+\eqref{eq:integral-approx}, with lumped weights $c_k = V_k$
+(consistent with $C_{kk} = V_k/3^D$ since $\sum_k C_{kk}\ne\sum_k V_k$
+in general; the centre-point rule differs from the hat-function quadrature
+by a factor of $3^D$, but both are consistent first-order approximations).
 
 % ============================================================
 \section{Infinite-Dimensional Sampling Methods}
