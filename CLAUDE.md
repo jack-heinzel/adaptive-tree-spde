@@ -44,3 +44,17 @@ jupyter notebook
 # or
 jupyter lab
 ```
+
+## Lab Notebook (`draft/main.tex`)
+
+The LaTeX document in `draft/` functions as a **lab notebook**: it documents
+experiments, derives the mathematics, and records design decisions as they are
+made.  It is not a polished paper.
+
+**Appendix: Lessons Learned and Paths Avoided** (`\label{sec:lessons}`) is a
+running record of approaches that were explored and ruled out, together with the
+reason why.  Whenever a promising direction turns out to be a dead end, add an
+entry here — this prevents the same dead ends from being rediscovered.  Current
+entries: Delaunay triangulation (combinatorial explosion in $D\ge 3$,
+non-static under refinement) and why the hat-function tree basis was chosen
+instead.

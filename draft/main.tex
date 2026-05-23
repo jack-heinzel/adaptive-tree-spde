@@ -1407,4 +1407,77 @@ accept $O(m)$ per-step cost without the precomputed eigenvalues.
 \bibliographystyle{plainnat}
 \bibliography{refs}
 
+% ============================================================
+\appendix
+% ============================================================
+
+\section{Lessons Learned and Paths Avoided}
+\label{sec:lessons}
+
+This appendix records design decisions that were made, approaches that were
+tried and abandoned, and reasons why certain seemingly natural paths turned out
+to be dead ends.  It is intended as a living lab-notebook entry: when a
+promising direction is ruled out, the reasoning should be recorded here so it
+need not be rediscovered later.
+
+\subsection{Delaunay Triangulation Does Not Scale to Higher Dimensions}
+\label{sec:lesson-delaunay}
+
+The Level-1 method (Section~\ref{sec:triangulation}) builds a Delaunay
+triangulation of the domain and assembles FEM matrices over the resulting
+simplices.  Two obstacles make this approach untenable in dimensions $D \ge 3$
+or even in $D=2$ once adaptive resolution is required.
+
+\paragraph{Combinatorial explosion of simplices.}
+The number of Delaunay simplices needed to triangulate $[0,1]^D$ grows at
+least as fast as $D!$ in the number of vertices (and this lower bound is
+believed to be tight, though the precise asymptotics remain an open problem in
+combinatorics~\citep{devadoss2011discrete}).  Concretely, a regular grid of
+$n^D$ points in $D$ dimensions produces $O(n^D \cdot D!)$ simplices: already
+for $D=4$ and a modest $n=10$ this yields millions of simplices.  FEM matrix
+assembly over all of them is prohibitive.
+
+\paragraph{Non-stationarity of the triangulation under refinement.}
+Adaptive resolution requires adding new vertices to the mesh.  Inserting a
+point into a Delaunay triangulation triggers a Bowyer--Watson cascade of
+simplex flips whose extent is unpredictable (it depends on the local geometry).
+This means the mesh is \emph{not static}: the full triangulation, and hence the
+FEM matrices $C$ and $G$, must be recomputed from scratch after every RJMCMC
+birth or death move.  The cost per move is therefore $O(m \log m)$ just for
+retriangulation, before any matrix assembly.
+
+\paragraph{Conclusion.}
+Delaunay triangulation is a natural first choice but hits a fundamental
+combinatorial wall in higher dimensions and does not compose well with adaptive
+sampling.  We abandon it in favour of the hat-function tree basis described in
+Section~\ref{sec:adaptive-tri}.
+
+\subsection{Hat-Function Tree Basis as the Natural Replacement}
+\label{sec:lesson-tree-basis}
+
+The adaptive hierarchical basis (Section~\ref{sec:adaptive-tri}) resolves both
+obstacles above.
+
+\begin{itemize}
+  \item \textbf{No combinatorial explosion.}
+    A $D$-dimensional basis function is the product of $D$ one-dimensional
+    functions (constant, linear, or hat).  Adding a node to the tree requires
+    only $O(D)$ work to compute its states and at most $O(D)$ new inner
+    products to update $C$ and $G$; no global retriangulation is needed.
+  \item \textbf{Static structure under refinement.}
+    The mass and stiffness matrices have a \emph{recursive block structure}
+    tied to the tree (Section~\ref{sec:hat-mass}).  A birth move in dimension
+    $d$ splits one block into sub-blocks; existing off-diagonal blocks are
+    unchanged (sibling hats have zero mass overlap, Eq.~\eqref{eq:C-block-zero}).
+    The stiffness matrix $G$ is diagonal and stays diagonal after any birth
+    (Section~\ref{sec:hat-stiffness}).  FEM matrix updates are therefore local
+    and $O(1)$ per move.
+  \item \textbf{Natural low-to-high resolution ordering.}
+    The tree encodes a multi-resolution hierarchy: the root is the constant
+    function~1, and successive refinements add finer and finer hat functions.
+    This gives a principled prior over resolution and a natural initialisation
+    (start at the root, i.e., a constant intensity field) rather than requiring
+    an expensive high-resolution mesh as the initial condition.
+\end{itemize}
+
 \end{document}
