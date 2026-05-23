@@ -1,64 +1,72 @@
 """
-Adaptive hierarchical hat-function basis on [0, 1]^D (or any rectangular domain).
+Adaptive hierarchical basis on [0, 1]^D.
 
-Basis functions
----------------
-A D-dimensional basis function is the product of D one-dimensional hat functions:
+1D hierarchy per dimension
+--------------------------
+Each dimension follows a fixed hierarchy:
 
-    phi(x) = prod_{d=0}^{D-1}  hat(x_d ; lo_d, hi_d)
+    level 0 — CONST   f(x) = 1
+    level 1 — LINEAR  f(x) = x
+    level 2 — HAT     f(x) = hat(x; 0, 1)  (unit hat, peaks at 0.5)
+    level 3+ — dyadic sub-hats:
+               hat(x; lo, hi) has two children at midpoint m = (lo+hi)/2:
+                   hat(x; lo, m)   left child
+                   hat(x; m,  hi)  right child
 
-where the 1-D hat on [lo, hi] (width w = hi - lo, peak at midpoint m = lo + w/2) is:
+The collection {1, x, hat(·;0,1), hat(·;0,½), hat(·;½,1), ...} is the
+Schauder basis for C([0,1]).
 
-    hat(x ; lo, hi) = { 0                   if  x  < lo  or  x > hi
-                      { 2 (x  - lo) / w      if  lo <= x <= m
-                      { 2 (hi -  x) / w      if  m  <= x <= hi
+D-dimensional basis
+-------------------
+Each tree node k holds a D-tuple of 1D states s_d^(k).  Its basis function is
 
-The function is piecewise linear, equals 1 at the midpoint, and is 0 at lo and hi.
+    φ_k(x) = ∏_d  f_{s_d^(k)}(x_d)
+
+The root has all dims at CONST: φ_root(x) = 1.
+The active basis = ALL nodes (root + internal + leaves).
 
 Tree structure
 --------------
-Nodes are arranged in a rooted binary tree.
+A birth move advances exactly one dimension by one step:
+    CONST  → LINEAR  : 1 new child
+    LINEAR → HAT     : 1 new child
+    HAT    → sub-hats: 2 new children (left and right)
 
-Root: covers the full domain, intervals = bounds.
-
-A node with intervals [(lo_0,hi_0), ..., (lo_{D-1},hi_{D-1})] split in dimension d
-produces two children sharing all intervals except dimension d:
-    left  child: [lo_d,  mid_d] in dim d   (lower half, split_side = 0)
-    right child: [mid_d, hi_d ] in dim d   (upper half, split_side = 1)
-
-where mid_d = (lo_d + hi_d) / 2.  Splits are always at midpoints — no split_val
-needs to be stored.
-
-Active basis = leaf nodes.  Refine (birth) a leaf by splitting it in a chosen
-dimension; coarsen (death) an internal node whose two children are both leaves.
+Each node can be split at most once (in one chosen dimension).
+BFS heap: node i → left child 2i+1, right child 2i+2.
+For CONST→LINEAR and LINEAR→HAT births, only the left child slot is used.
 
 BFS serialisation (TreeState)
 ------------------------------
-For use in jax.lax.scan and with JAX-based HMC, the tree is serialised in BFS
-heap order (node i → children 2i+1 and 2i+2) into two fixed-shape arrays:
+Fixed-shape arrays of length max_nodes = 2^(max_depth+1) - 1:
 
-    split_dim  (max_nodes,) int32   split dimension for internal nodes;  -1 elsewhere
-    rates      (max_nodes,) float64 field coefficient at leaf nodes;     NaN elsewhere
+    split_dim  (max_nodes,) int32   split dim for internal nodes;    -1 elsewhere
+    split_type (max_nodes,) int32   0=CONST→LINEAR, 1=LINEAR→HAT,
+                                    2=HAT split;                      -1 elsewhere
+    rates      (max_nodes,) float   coefficient for each active node; NaN if absent
 
-    max_nodes = 2^(max_depth+1) - 1
+Node classification:
+    internal : split_dim[i] >= 0
+    leaf     : split_dim[i] <  0  AND  isfinite(rates[i])
+    absent   : split_dim[i] <  0  AND  isnan(rates[i])
 
-Because splits are always at midpoints, the intervals at any BFS node can be
-recomputed from the root bounds and the split_dim sequence along its path.
-compute_node_intervals() builds a (max_nodes, D, 2) lookup table for the current
-tree, which can then be passed to the JAX evaluation functions below.
+Both internal and leaf nodes are active (all have finite rates).
+
+Precomputed state arrays (built by compute_node_states after each RJ move):
+
+    node_kind  (max_nodes, D) int32   per-dim kind: CONST=0, LINEAR=1, HAT=2
+    node_lo    (max_nodes, D) float   per-dim lo for HAT; 0 otherwise
+    node_hi    (max_nodes, D) float   per-dim hi for HAT; 1 otherwise
 
 JAX evaluation
 --------------
-eval_basis_jax(x, node_intervals, leaf_mask)
-    -> (max_nodes,) float — active hat values at point x (zero for non-leaves)
+eval_basis_jax(x, node_kind, node_lo, node_hi, active_mask)
+    -> (max_nodes,) float  — phi_i(x) for active nodes, 0 for absent
 
-design_matrix_jax(X, node_intervals, leaf_mask)
-    -> (n_pts, max_nodes) float — design matrix Phi
+design_matrix_jax(X, node_kind, node_lo, node_hi, active_mask)
+    -> (n_pts, max_nodes) float
 
-To evaluate log λ(x) = rates · phi(x):
-
-    phi = eval_basis_jax(x, node_intervals, leaf_mask)
-    log_lambda = jnp.dot(jnp.where(leaf_mask, rates, 0.0), phi)
+log λ(x) = jnp.dot(jnp.where(active_mask, rates, 0.0), phi)
 """
 
 from __future__ import annotations
@@ -72,7 +80,14 @@ import jax
 import jax.numpy as jnp
 
 
-# ── BFS index arithmetic ───────────────────────────────────────────────────────
+# ── 1D state kinds ────────────────────────────────────────────────────────────
+
+CONST  = 0   # f(x) = 1
+LINEAR = 1   # f(x) = x
+HAT    = 2   # f(x) = hat(x; lo, hi)
+
+
+# ── BFS index arithmetic ──────────────────────────────────────────────────────
 
 def bfs_left(i: int) -> int:
     return 2 * i + 1
@@ -90,10 +105,9 @@ def max_nodes_for_depth(max_depth: int) -> int:
     return 2 ** (max_depth + 1) - 1
 
 
-# ── 1D hat function ────────────────────────────────────────────────────────────
+# ── 1D hat function (NumPy) ───────────────────────────────────────────────────
 
 def hat1d(x: float, lo: float, hi: float) -> float:
-    """1D hat function at a single point."""
     w = hi - lo
     m = lo + w / 2.0
     if x < lo or x > hi:
@@ -102,7 +116,6 @@ def hat1d(x: float, lo: float, hi: float) -> float:
 
 
 def hat1d_np(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
-    """Vectorised 1D hat over a NumPy array."""
     w = hi - lo
     m = lo + w / 2.0
     rising  = 2.0 * (x - lo) / w
@@ -111,31 +124,84 @@ def hat1d_np(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
     return np.where((x < lo) | (x > hi), 0.0, val)
 
 
+# ── State1D ───────────────────────────────────────────────────────────────────
+
+@dataclass
+class State1D:
+    """One-dimensional component state for a single dimension of a basis node."""
+    kind: int          # CONST, LINEAR, or HAT
+    lo:   float = 0.0  # support lo (meaningful for HAT only)
+    hi:   float = 1.0  # support hi (meaningful for HAT only)
+
+    def eval(self, x: float) -> float:
+        if self.kind == CONST:
+            return 1.0
+        elif self.kind == LINEAR:
+            return float(x)
+        else:
+            return hat1d(x, self.lo, self.hi)
+
+    def eval_np(self, x: np.ndarray) -> np.ndarray:
+        if self.kind == CONST:
+            return np.ones_like(x, dtype=float)
+        elif self.kind == LINEAR:
+            return np.asarray(x, dtype=float)
+        else:
+            return hat1d_np(x, self.lo, self.hi)
+
+    # ── child rules ──────────────────────────────────────────────────────────
+
+    def child_linear(self) -> "State1D":
+        assert self.kind == CONST
+        return State1D(LINEAR)
+
+    def child_hat(self) -> "State1D":
+        assert self.kind == LINEAR
+        return State1D(HAT, 0.0, 1.0)
+
+    def child_left(self) -> "State1D":
+        assert self.kind == HAT
+        m = (self.lo + self.hi) / 2.0
+        return State1D(HAT, self.lo, m)
+
+    def child_right(self) -> "State1D":
+        assert self.kind == HAT
+        m = (self.lo + self.hi) / 2.0
+        return State1D(HAT, m, self.hi)
+
+    def __repr__(self) -> str:
+        if self.kind == CONST:
+            return "CONST"
+        elif self.kind == LINEAR:
+            return "LINEAR"
+        else:
+            return f"HAT({self.lo:.3g},{self.hi:.3g})"
+
+
 # ── BasisNode ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class BasisNode:
     """
-    A single multilinear hat basis function.
+    A single D-dimensional basis function: product of D 1D states.
 
-    intervals   (D, 2) float array — [lo, hi] per dimension
-    parent      BasisNode or None (None for root)
-    split_dim   which dimension of the PARENT was split to create this node
-    split_side  0 = left child (lower half), 1 = right child (upper half)
-    left        lower-half child after splitting this node; None if leaf
-    right       upper-half child after splitting this node; None if leaf
-    _own_dim    dimension in which THIS node was split (set by refine)
+    states      D State1D objects, one per dimension
+    parent      parent node (None for root)
+    split_dim   dimension of the parent birth move that created this node
+    split_side  None for CONST→LINEAR / LINEAR→HAT; 0=left, 1=right for HAT splits
+    left        left child after this node is refined; None if leaf
+    right       right child after HAT split; None for 1-child splits or leaf
+    _own_dim    dimension in which THIS node was refined
+    _own_type   0=CONST→LINEAR, 1=LINEAR→HAT, 2=HAT split
     """
-
-    intervals:  np.ndarray
-    parent:     Optional["BasisNode"] = field(default=None,  repr=False)
-    split_dim:  Optional[int]         = None   # dim of parent split → this node
-    split_side: Optional[int]         = None   # 0=left, 1=right
-    left:       Optional["BasisNode"] = field(default=None,  repr=False)
-    right:      Optional["BasisNode"] = field(default=None,  repr=False)
-    _own_dim:   Optional[int]         = None   # dim this node was split in
-
-    # ── intrinsic properties ──────────────────────────────────────────────────
+    states:     list[State1D]
+    parent:     Optional["BasisNode"] = field(default=None, repr=False)
+    split_dim:  Optional[int]         = None
+    split_side: Optional[int]         = None
+    left:       Optional["BasisNode"] = field(default=None, repr=False)
+    right:      Optional["BasisNode"] = field(default=None, repr=False)
+    _own_dim:   Optional[int]         = None
+    _own_type:  Optional[int]         = None
 
     @property
     def is_leaf(self) -> bool:
@@ -143,58 +209,39 @@ class BasisNode:
 
     @property
     def D(self) -> int:
-        return self.intervals.shape[0]
-
-    @property
-    def center(self) -> np.ndarray:
-        """Midpoint per dimension — the location where phi = 1."""
-        return (self.intervals[:, 0] + self.intervals[:, 1]) / 2.0
-
-    @property
-    def widths(self) -> np.ndarray:
-        return self.intervals[:, 1] - self.intervals[:, 0]
-
-    # ── evaluation ───────────────────────────────────────────────────────────
+        return len(self.states)
 
     def eval(self, x: np.ndarray) -> float:
-        """Evaluate the multilinear hat at a single point x (D,)."""
         v = 1.0
-        for d in range(self.D):
-            v *= hat1d(float(x[d]),
-                       float(self.intervals[d, 0]),
-                       float(self.intervals[d, 1]))
+        for d, s in enumerate(self.states):
+            v *= s.eval(float(x[d]))
         return v
 
     def eval_batch(self, X: np.ndarray) -> np.ndarray:
-        """Evaluate at multiple points X (n, D) → (n,) array."""
         v = np.ones(len(X))
-        for d in range(self.D):
-            v *= hat1d_np(X[:, d],
-                          float(self.intervals[d, 0]),
-                          float(self.intervals[d, 1]))
+        for d, s in enumerate(self.states):
+            v *= s.eval_np(X[:, d])
         return v
 
     def __repr__(self) -> str:
-        ivs = ", ".join(f"[{lo:.3g},{hi:.3g}]" for lo, hi in self.intervals)
-        return f"BasisNode(intervals=[{ivs}], leaf={self.is_leaf})"
+        return f"BasisNode(states={self.states}, leaf={self.is_leaf})"
 
 
 # ── AdaptiveGridTree ──────────────────────────────────────────────────────────
 
 class AdaptiveGridTree:
     """
-    Adaptive hierarchical basis of multilinear hat functions.
+    Adaptive hierarchical basis of D-dimensional product functions.
 
-    The active basis is the set of leaf nodes.  Each leaf holds a D-dimensional
-    hat function; its support is the product of D intervals, and it peaks at 1
-    at the product of D midpoints.
+    The active basis is ALL nodes (root + internal + leaves).  Each node's
+    basis function is a product of D 1D components following the
+    CONST → LINEAR → HAT → sub-hat hierarchy.
 
     Parameters
     ----------
-    D         : spatial dimension.
-    bounds    : list of (lo, hi) per dimension; defaults to [(0, 1)] * D.
-    max_depth : maximum tree depth (root = depth 0).  A node at max_depth
-                cannot be refined further.
+    D         : spatial dimension
+    bounds    : list of (lo, hi) per dimension; defaults to [(0, 1)] * D
+    max_depth : maximum tree depth (root = depth 0)
     """
 
     def __init__(
@@ -206,35 +253,29 @@ class AdaptiveGridTree:
         self.D = D
         self.max_depth = max_depth
         self.bounds = bounds if bounds is not None else [(0.0, 1.0)] * D
-        root_intervals = np.array([[lo, hi] for lo, hi in self.bounds], dtype=float)
-        self.root = BasisNode(intervals=root_intervals)
+        self.root = BasisNode(states=[State1D(CONST) for _ in range(D)])
 
     # ── tree traversal ────────────────────────────────────────────────────────
 
-    def leaves(self) -> list[BasisNode]:
-        """All leaf nodes in DFS (left-first pre-order) order."""
-        out: list[BasisNode] = []
-        stack = [self.root]
-        while stack:
-            node = stack.pop()
-            if node.is_leaf:
-                out.append(node)
-            else:
-                stack.append(node.right)
-                stack.append(node.left)
-        return out
-
     def all_nodes(self) -> list[BasisNode]:
-        """All nodes (internal + leaves) in DFS order."""
+        """All nodes (root + internal + leaves) in DFS left-first pre-order."""
         out: list[BasisNode] = []
         stack = [self.root]
         while stack:
             node = stack.pop()
             out.append(node)
             if not node.is_leaf:
-                stack.append(node.right)
+                if node.right is not None:
+                    stack.append(node.right)
                 stack.append(node.left)
         return out
+
+    def leaves(self) -> list[BasisNode]:
+        """All leaf nodes in DFS left-first pre-order."""
+        return [n for n in self.all_nodes() if n.is_leaf]
+
+    def n_nodes(self) -> int:
+        return len(self.all_nodes())
 
     def n_leaves(self) -> int:
         return len(self.leaves())
@@ -246,119 +287,110 @@ class AdaptiveGridTree:
             n = n.parent
         return d
 
-    # ── evaluation (NumPy) ────────────────────────────────────────────────────
+    # ── evaluation ────────────────────────────────────────────────────────────
 
     def eval_basis(self, x: np.ndarray) -> np.ndarray:
-        """
-        Evaluate all active basis functions at a single point x (D,).
-        Returns (n_leaves,) in DFS leaf order.
-        """
-        return np.array([node.eval(x) for node in self.leaves()])
+        """Evaluate all active basis functions at x (D,). Returns (n_nodes,)."""
+        return np.array([node.eval(x) for node in self.all_nodes()])
 
     def design_matrix(self, X: np.ndarray) -> np.ndarray:
-        """
-        Design matrix Phi where Phi[i, j] = phi_j(X[i]).
-        Returns (n_pts, n_leaves).
-        """
-        lv = self.leaves()
-        out = np.zeros((len(X), len(lv)))
-        for j, node in enumerate(lv):
+        """Design matrix Phi[i,j] = phi_j(X[i]). Returns (n_pts, n_nodes)."""
+        nodes = self.all_nodes()
+        out = np.zeros((len(X), len(nodes)))
+        for j, node in enumerate(nodes):
             out[:, j] = node.eval_batch(X)
         return out
 
     # ── refinement ───────────────────────────────────────────────────────────
 
-    def refine(
-        self,
-        node: BasisNode,
-        dim: int,
-    ) -> tuple[BasisNode, BasisNode]:
+    def refine(self, node: BasisNode, dim: int) -> tuple[BasisNode, ...]:
         """
-        Split a leaf node in dimension `dim` at the midpoint of its `dim`-th
-        interval.  Returns (left_child, right_child).
+        Advance dimension `dim` by one step.
 
-        Left child  takes the lower half: [..., (lo_d, mid_d), ...].
-        Right child takes the upper half: [..., (mid_d, hi_d), ...].
-        All other D-1 intervals are inherited unchanged.
+        Returns (child,) for CONST→LINEAR or LINEAR→HAT;
+        returns (left, right) for a HAT split.
         """
         if not node.is_leaf:
             raise ValueError(f"Node {node!r} is not a leaf.")
         if dim < 0 or dim >= self.D:
             raise ValueError(f"dim={dim} out of range [0, {self.D}).")
         if self.depth(node) >= self.max_depth:
-            raise ValueError(
-                f"Cannot refine: node is already at max_depth={self.max_depth}."
-            )
+            raise ValueError(f"Cannot refine: already at max_depth={self.max_depth}.")
 
-        lo_d = float(node.intervals[dim, 0])
-        hi_d = float(node.intervals[dim, 1])
-        mid  = (lo_d + hi_d) / 2.0
+        s = node.states[dim]
 
-        left_iv         = node.intervals.copy();  left_iv[dim, 1]  = mid
-        right_iv        = node.intervals.copy();  right_iv[dim, 0] = mid
+        if s.kind == CONST:
+            cs = list(node.states); cs[dim] = s.child_linear()
+            child = BasisNode(states=cs, parent=node, split_dim=dim, split_side=None)
+            node.left = child
+            node._own_dim = dim;  node._own_type = 0
+            return (child,)
 
-        left  = BasisNode(intervals=left_iv,  parent=node, split_dim=dim, split_side=0)
-        right = BasisNode(intervals=right_iv, parent=node, split_dim=dim, split_side=1)
+        elif s.kind == LINEAR:
+            cs = list(node.states); cs[dim] = s.child_hat()
+            child = BasisNode(states=cs, parent=node, split_dim=dim, split_side=None)
+            node.left = child
+            node._own_dim = dim;  node._own_type = 1
+            return (child,)
 
-        node.left     = left
-        node.right    = right
-        node._own_dim = dim
-
-        return left, right
+        else:  # HAT
+            ls = list(node.states); ls[dim] = s.child_left()
+            rs = list(node.states); rs[dim] = s.child_right()
+            left  = BasisNode(states=ls, parent=node, split_dim=dim, split_side=0)
+            right = BasisNode(states=rs, parent=node, split_dim=dim, split_side=1)
+            node.left = left;  node.right = right
+            node._own_dim = dim;  node._own_type = 2
+            return (left, right)
 
     def coarsen(self, node: BasisNode) -> None:
-        """
-        Merge a node's two leaf children back into a single leaf.
-        Both node.left and node.right must be leaves.
-        """
+        """Remove all children of node (all children must be leaves)."""
         if node.is_leaf:
-            raise ValueError("Node has no children to merge.")
-        if not (node.left.is_leaf and node.right.is_leaf):
-            raise ValueError("Both children must be leaves to merge.")
-
+            raise ValueError("Node has no children to remove.")
+        if not node.left.is_leaf:
+            raise ValueError("Left child must be a leaf to coarsen.")
+        if node.right is not None and not node.right.is_leaf:
+            raise ValueError("Right child must be a leaf to coarsen.")
         node.left = node.right = None
-        node._own_dim = None
+        node._own_dim = node._own_type = None
 
-    # ── RJMCMC helpers ────────────────────────────────────────────────────────
+    # ── RJMCMC helpers ───────────────────────────────────────────────────────
 
     def splittable_leaves(self) -> list[BasisNode]:
-        """Leaf nodes that can be split (depth < max_depth)."""
+        """Leaves that can be refined (depth < max_depth)."""
         return [n for n in self.leaves() if self.depth(n) < self.max_depth]
 
     def mergeable_nodes(self) -> list[BasisNode]:
-        """Internal nodes whose two children are both leaves."""
-        return [
-            n for n in self.all_nodes()
-            if not n.is_leaf and n.left.is_leaf and n.right.is_leaf
-        ]
+        """Internal nodes whose children are all leaves."""
+        result = []
+        for n in self.all_nodes():
+            if not n.is_leaf:
+                left_ok  = n.left is not None and n.left.is_leaf
+                right_ok = (n.right is None) or n.right.is_leaf
+                if left_ok and right_ok:
+                    result.append(n)
+        return result
 
 
-# ── TreeState (BFS serialisation) ─────────────────────────────────────────────
+# ── TreeState (BFS serialisation) ────────────────────────────────────────────
 
 class TreeState:
     """
-    Fixed-shape BFS tree state for use in jax.lax.scan.
+    Fixed-shape BFS serialisation for use with JAX.
 
-    split_dim  (max_nodes,) int32   — split dim for internal nodes;  -1 elsewhere
-    rates      (max_nodes,) float   — field coefficient at leaves;   NaN elsewhere
+    split_dim  (max_nodes,) int32  split dim for internal nodes;    -1 elsewhere
+    split_type (max_nodes,) int32  0=CONST→LINEAR, 1=LINEAR→HAT,
+                                   2=HAT split;                      -1 elsewhere
+    rates      (max_nodes,) float  coefficient for each active node; NaN if absent
 
-    Both arrays have length  max_nodes = 2^(max_depth+1) - 1.
-
-    Node classification at BFS index i:
-        internal  :  split_dim[i] >= 0
-        leaf      :  split_dim[i] <  0  AND  isfinite(rates[i])
-        absent    :  split_dim[i] <  0  AND  isnan(rates[i])
-
-    Because splits are always at midpoints, the intervals at any BFS node are
-    fully determined by the root bounds and the split_dim values of its ancestors
-    — no split coordinate needs to be stored.
+    Both internal and leaf nodes have finite rates.
     """
 
-    __slots__ = ("split_dim", "rates")
+    __slots__ = ("split_dim", "split_type", "rates")
 
-    def __init__(self, split_dim: jnp.ndarray, rates: jnp.ndarray):
-        self.split_dim = split_dim  # (max_nodes,) int32
-        self.rates     = rates      # (max_nodes,) float
+    def __init__(self, split_dim, split_type, rates):
+        self.split_dim  = split_dim   # (max_nodes,) int32
+        self.split_type = split_type  # (max_nodes,) int32
+        self.rates      = rates       # (max_nodes,) float
 
     @property
     def max_nodes(self) -> int:
@@ -370,80 +402,69 @@ class TreeState:
 
     # ── masks ─────────────────────────────────────────────────────────────────
 
+    def active_mask(self) -> jnp.ndarray:
+        """(max_nodes,) bool: True for all active nodes (leaf or internal)."""
+        return jnp.isfinite(self.rates)
+
     def leaf_mask(self) -> jnp.ndarray:
-        """(max_nodes,) bool: True for leaf nodes."""
+        """(max_nodes,) bool: True for leaf nodes (active and not split)."""
         return (self.split_dim < 0) & jnp.isfinite(self.rates)
 
     def internal_mask(self) -> jnp.ndarray:
         return self.split_dim >= 0
 
-    def occupied_mask(self) -> jnp.ndarray:
-        return (self.split_dim >= 0) | jnp.isfinite(self.rates)
+    # ── counts ────────────────────────────────────────────────────────────────
 
-    # ── Python-level counts ───────────────────────────────────────────────────
+    def n_nodes(self) -> int:
+        return int(self.active_mask().sum())
 
     def n_leaves(self) -> int:
         return int(self.leaf_mask().sum())
 
-    def n_nodes(self) -> int:
-        return int(self.occupied_mask().sum())
-
     def leaf_bfs_indices(self) -> np.ndarray:
-        """BFS indices of all leaves, in BFS (breadth-first) order."""
         return np.where(np.array(self.leaf_mask()))[0]
 
-    # ── functional updates (return new TreeState) ─────────────────────────────
+    def active_bfs_indices(self) -> np.ndarray:
+        return np.where(np.array(self.active_mask()))[0]
+
+    # ── functional updates ────────────────────────────────────────────────────
 
     def birth_update(
         self,
-        leaf_i: int,
-        split_dim: int,
-        rate_left: float,
-        rate_right: float,
+        leaf_i:     int,
+        dim:        int,
+        split_type: int,        # 0=CONST→LINEAR, 1=LINEAR→HAT, 2=HAT split
+        rate_left:  float,
+        rate_right: float = float("nan"),  # only used for split_type == 2
     ) -> "TreeState":
-        """
-        Split leaf at BFS index `leaf_i` in dimension `split_dim`.
-        Left child (lower half) gets rate_left; right child gets rate_right.
-        """
         li = bfs_left(leaf_i)
         ri = bfs_right(leaf_i)
         if ri >= self.max_nodes:
             raise ValueError(
-                f"Birth at BFS index {leaf_i} would place children at {ri} "
-                f">= max_nodes={self.max_nodes}.  Increase max_depth."
+                f"Birth at BFS {leaf_i} would exceed max_nodes={self.max_nodes}."
             )
-        sd = self.split_dim.at[leaf_i].set(split_dim)
-        r  = (
-            self.rates
-            .at[leaf_i].set(jnp.nan)
-            .at[li].set(rate_left)
-            .at[ri].set(rate_right)
-        )
-        return TreeState(sd, r)
+        sd = self.split_dim.at[leaf_i].set(dim)
+        st = self.split_type.at[leaf_i].set(split_type)
+        r  = self.rates.at[li].set(rate_left)
+        if split_type == 2:
+            r = r.at[ri].set(rate_right)
+        return TreeState(sd, st, r)
 
-    def death_update(
-        self,
-        internal_i: int,
-        merged_rate: float,
-    ) -> "TreeState":
-        """
-        Merge the two leaf children of `internal_i` back into a single leaf.
-        Both bfs_left(internal_i) and bfs_right(internal_i) must be leaves.
-        """
-        li = bfs_left(internal_i)
-        ri = bfs_right(internal_i)
+    def death_update(self, internal_i: int) -> "TreeState":
+        """Remove children of internal_i (children must be leaves).
+        The parent's rate is unchanged."""
+        li    = bfs_left(internal_i)
+        ri    = bfs_right(internal_i)
+        stype = int(self.split_type[internal_i])
         sd = self.split_dim.at[internal_i].set(-1)
-        r  = (
-            self.rates
-            .at[internal_i].set(merged_rate)
-            .at[li].set(jnp.nan)
-            .at[ri].set(jnp.nan)
-        )
-        return TreeState(sd, r)
+        st = self.split_type.at[internal_i].set(-1)
+        r  = self.rates.at[li].set(jnp.nan)
+        if stype == 2 and ri < self.max_nodes:
+            r = r.at[ri].set(jnp.nan)
+        return TreeState(sd, st, r)
 
     def update_rates(self, new_rates: jnp.ndarray) -> "TreeState":
-        """Replace the rates array (used after an HMC within-model step)."""
-        return TreeState(self.split_dim, new_rates)
+        return TreeState(self.split_dim, self.split_type, new_rates)
 
     def __repr__(self) -> str:
         return (
@@ -455,74 +476,71 @@ class TreeState:
 # ── Constructors ──────────────────────────────────────────────────────────────
 
 def empty_tree_state(max_depth: int, dtype=jnp.float64) -> TreeState:
-    """All-absent tree state (no nodes allocated)."""
     mn = max_nodes_for_depth(max_depth)
     return TreeState(
-        split_dim=jnp.full(mn, -1,      dtype=jnp.int32),
-        rates    =jnp.full(mn, jnp.nan, dtype=dtype),
+        split_dim  = jnp.full(mn, -1,       dtype=jnp.int32),
+        split_type = jnp.full(mn, -1,       dtype=jnp.int32),
+        rates      = jnp.full(mn, jnp.nan,  dtype=dtype),
     )
 
 def root_only_state(rate: float, max_depth: int, dtype=jnp.float64) -> TreeState:
-    """Single root leaf with the given coefficient."""
+    """Single root node (constant function) with the given coefficient."""
     s = empty_tree_state(max_depth, dtype)
-    return TreeState(s.split_dim, s.rates.at[0].set(rate))
+    return TreeState(s.split_dim, s.split_type, s.rates.at[0].set(rate))
 
 
 # ── Wrap: AdaptiveGridTree → TreeState ───────────────────────────────────────
 
 def wrap_to_tree_state(
-    tree: AdaptiveGridTree,
-    rates: np.ndarray,
+    tree:      AdaptiveGridTree,
+    rates:     np.ndarray,
     max_depth: int,
     dtype=jnp.float64,
 ) -> TreeState:
     """
-    Serialise an AdaptiveGridTree together with per-leaf coefficients into a
-    fixed-shape TreeState.
+    Serialise an AdaptiveGridTree with per-node coefficients into a TreeState.
 
     Parameters
     ----------
-    tree      : AdaptiveGridTree whose structure to encode.
-    rates     : (n_leaves,) array of field coefficients in DFS leaf order
-                (matching tree.leaves()).
-    max_depth : depth of the backing arrays; must be >= tree depth.
+    tree      : tree whose structure to encode
+    rates     : (n_nodes,) coefficients in DFS all-nodes order (tree.all_nodes())
+    max_depth : depth of the backing arrays; must be >= tree depth
 
     Returns
     -------
-    TreeState with split_dim and rates populated.
+    TreeState with split_dim, split_type, and rates populated.
     """
-    mn   = max_nodes_for_depth(max_depth)
-    sd   = -np.ones(mn, dtype=np.int32)
-    rt   = np.full(mn, np.nan)
+    mn    = max_nodes_for_depth(max_depth)
+    sd    = -np.ones(mn, dtype=np.int32)
+    st    = -np.ones(mn, dtype=np.int32)
+    rt    = np.full(mn, np.nan)
     rates = np.asarray(rates, dtype=float)
 
-    # BFS pass: assign every node a BFS index; record split_dim for internals.
-    cell_to_bfs: dict[int, int] = {}
+    node_to_bfs: dict[int, int] = {}
+
     queue: deque[tuple[BasisNode, int]] = deque([(tree.root, 0)])
     while queue:
         node, bfs_i = queue.popleft()
         if bfs_i >= mn:
-            raise ValueError(
-                f"Tree exceeds max_depth={max_depth}; node at BFS {bfs_i} >= {mn}."
-            )
-        cell_to_bfs[id(node)] = bfs_i
+            raise ValueError(f"Tree exceeds max_depth={max_depth}.")
+        node_to_bfs[id(node)] = bfs_i
         if not node.is_leaf:
             sd[bfs_i] = node._own_dim
-            queue.append((node.left,  bfs_left(bfs_i)))
-            queue.append((node.right, bfs_right(bfs_i)))
+            st[bfs_i] = node._own_type
+            queue.append((node.left, bfs_left(bfs_i)))
+            if node.right is not None:
+                queue.append((node.right, bfs_right(bfs_i)))
 
-    # DFS pass: assign rates in leaves() order (matches FEM / likelihood assembly).
-    leaves_dfs = tree.leaves()
-    if len(leaves_dfs) != len(rates):
-        raise ValueError(
-            f"rates length {len(rates)} != tree leaves {len(leaves_dfs)}."
-        )
-    for leaf, rate in zip(leaves_dfs, rates):
-        rt[cell_to_bfs[id(leaf)]] = rate
+    nodes_dfs = tree.all_nodes()
+    if len(nodes_dfs) != len(rates):
+        raise ValueError(f"rates length {len(rates)} != n_nodes {len(nodes_dfs)}.")
+    for node, rate in zip(nodes_dfs, rates):
+        rt[node_to_bfs[id(node)]] = rate
 
     return TreeState(
-        split_dim=jnp.array(sd),
-        rates    =jnp.array(rt, dtype=dtype),
+        split_dim  = jnp.array(sd),
+        split_type = jnp.array(st),
+        rates      = jnp.array(rt, dtype=dtype),
     )
 
 
@@ -530,213 +548,234 @@ def wrap_to_tree_state(
 
 def unwrap_to_tree(
     tree_state: TreeState,
-    D: int,
-    bounds: list[tuple[float, float]] | None = None,
-    max_depth: int | None = None,
+    D:          int,
+    bounds:     list[tuple[float, float]] | None = None,
+    max_depth:  int | None = None,
 ) -> tuple[AdaptiveGridTree, np.ndarray]:
     """
     Reconstruct an AdaptiveGridTree from a TreeState.
 
-    Since splits are at midpoints, no extra data is needed — the tree geometry
-    is fully determined by split_dim and the root bounds.
-
-    Parameters
-    ----------
-    tree_state : TreeState to decode.
-    D          : spatial dimension.
-    bounds     : [(lo_d, hi_d), ...]; defaults to [(0, 1)] * D.
-    max_depth  : passed to AdaptiveGridTree; defaults to tree_state.max_depth.
-
     Returns
     -------
-    tree       : AdaptiveGridTree with the same structure as was serialised.
-    leaf_rates : (n_leaves,) float array in DFS leaf order (matching tree.leaves()).
+    tree       : AdaptiveGridTree with the encoded structure
+    node_rates : (n_nodes,) float array in DFS all-nodes order
     """
-    if bounds is None:
-        bounds = [(0.0, 1.0)] * D
     if max_depth is None:
         max_depth = tree_state.max_depth
 
-    sd   = np.array(tree_state.split_dim)
-    rt   = np.array(tree_state.rates)
-    mn   = tree_state.max_nodes
-    root_iv = np.array([[lo, hi] for lo, hi in bounds], dtype=float)
+    sd  = np.array(tree_state.split_dim)
+    st  = np.array(tree_state.split_type)
+    rt  = np.array(tree_state.rates)
+    mn  = tree_state.max_nodes
 
     tree = AdaptiveGridTree(D, bounds, max_depth)
-    tree.root = BasisNode(intervals=root_iv)
+    tree.root = BasisNode(states=[State1D(CONST) for _ in range(D)])
 
-    cell_to_bfs: dict[int, int] = {}
-    queue: deque[tuple[BasisNode, int, np.ndarray]] = deque(
-        [(tree.root, 0, root_iv)])
+    node_to_bfs: dict[int, int] = {}
 
+    queue: deque[tuple[BasisNode, int]] = deque([(tree.root, 0)])
     while queue:
-        node, bfs_i, iv = queue.popleft()
-        cell_to_bfs[id(node)] = bfs_i
-        node.intervals = iv
-
+        node, bfs_i = queue.popleft()
         if bfs_i >= mn:
             continue
+        node_to_bfs[id(node)] = bfs_i
 
-        dim = int(sd[bfs_i])
-        if dim >= 0:
-            mid = (iv[dim, 0] + iv[dim, 1]) / 2.0
-            left_iv         = iv.copy();  left_iv[dim, 1]  = mid
-            right_iv        = iv.copy();  right_iv[dim, 0] = mid
+        dim   = int(sd[bfs_i])
+        stype = int(st[bfs_i])
+        if dim < 0:
+            continue
 
-            left  = BasisNode(intervals=left_iv,  parent=node, split_dim=dim, split_side=0)
-            right = BasisNode(intervals=right_iv, parent=node, split_dim=dim, split_side=1)
+        s = node.states[dim]
+        node._own_dim = dim;  node._own_type = stype
 
-            node.left     = left
-            node.right    = right
-            node._own_dim = dim
+        if stype == 0:   # CONST → LINEAR
+            cs = list(node.states); cs[dim] = s.child_linear()
+            child = BasisNode(states=cs, parent=node, split_dim=dim)
+            node.left = child
+            queue.append((child, bfs_left(bfs_i)))
 
-            queue.append((left,  bfs_left(bfs_i),  left_iv))
-            queue.append((right, bfs_right(bfs_i), right_iv))
+        elif stype == 1:  # LINEAR → HAT
+            cs = list(node.states); cs[dim] = s.child_hat()
+            child = BasisNode(states=cs, parent=node, split_dim=dim)
+            node.left = child
+            queue.append((child, bfs_left(bfs_i)))
 
-    # Collect leaf rates in DFS order (matches tree.leaves()).
-    leaves_dfs = tree.leaves()
-    leaf_rates = np.array([rt[cell_to_bfs[id(lf)]] for lf in leaves_dfs])
+        else:             # HAT split
+            ls = list(node.states); ls[dim] = s.child_left()
+            rs = list(node.states); rs[dim] = s.child_right()
+            left  = BasisNode(states=ls, parent=node, split_dim=dim, split_side=0)
+            right = BasisNode(states=rs, parent=node, split_dim=dim, split_side=1)
+            node.left = left;  node.right = right
+            queue.append((left,  bfs_left(bfs_i)))
+            queue.append((right, bfs_right(bfs_i)))
 
-    return tree, leaf_rates
+    nodes_dfs  = tree.all_nodes()
+    node_rates = np.array([rt[node_to_bfs[id(n)]] for n in nodes_dfs])
+    return tree, node_rates
 
 
-# ── Interval lookup table ────────────────────────────────────────────────────
+# ── Node state lookup table ───────────────────────────────────────────────────
 
-def compute_node_intervals(
+def compute_node_states(
     tree_state: TreeState,
     D: int,
-    bounds: list[tuple[float, float]] | None = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Build a (max_nodes, D, 2) NumPy array of node intervals for the current tree.
+    Build per-node 1D state arrays for the current tree.
 
-    Absent BFS slots have NaN intervals.  This table is precomputed once after
-    each RJ move and passed to the JAX evaluation functions below so that their
-    shape is static across HMC steps.
-
-    Parameters
-    ----------
-    tree_state : current tree state
-    D          : spatial dimension
-    bounds     : root intervals; defaults to [(0, 1)] * D
+    Traverses from the root, propagating the effect of each split.
+    Absent BFS slots keep their default (CONST, lo=0, hi=1).
 
     Returns
     -------
-    node_intervals : (max_nodes, D, 2) float array
+    node_kind : (max_nodes, D) int32  — CONST=0, LINEAR=1, HAT=2
+    node_lo   : (max_nodes, D) float  — lo for HAT; 0 for CONST/LINEAR
+    node_hi   : (max_nodes, D) float  — hi for HAT; 1 for CONST/LINEAR
     """
-    if bounds is None:
-        bounds = [(0.0, 1.0)] * D
+    sd  = np.array(tree_state.split_dim)
+    st  = np.array(tree_state.split_type)
+    mn  = tree_state.max_nodes
 
-    sd   = np.array(tree_state.split_dim)
-    mn   = tree_state.max_nodes
-    ivs  = np.full((mn, D, 2), np.nan)
+    node_kind = np.zeros((mn, D), dtype=np.int32)   # default: CONST
+    node_lo   = np.zeros((mn, D))
+    node_hi   = np.ones((mn, D))
 
-    root_iv = np.array([[lo, hi] for lo, hi in bounds], dtype=float)
-    queue: deque[tuple[int, np.ndarray]] = deque([(0, root_iv)])
+    root_kind = np.zeros(D, dtype=np.int32)
+    root_lo   = np.zeros(D)
+    root_hi   = np.ones(D)
+
+    queue: deque[tuple[int, np.ndarray, np.ndarray, np.ndarray]] = deque(
+        [(0, root_kind, root_lo, root_hi)]
+    )
 
     while queue:
-        bfs_i, iv = queue.popleft()
+        bfs_i, k, lo, hi = queue.popleft()
         if bfs_i >= mn:
             continue
-        ivs[bfs_i] = iv
-        dim = int(sd[bfs_i])
-        if dim >= 0:
-            mid = (iv[dim, 0] + iv[dim, 1]) / 2.0
-            l_iv = iv.copy();  l_iv[dim, 1] = mid
-            r_iv = iv.copy();  r_iv[dim, 0] = mid
-            queue.append((bfs_left(bfs_i),  l_iv))
-            queue.append((bfs_right(bfs_i), r_iv))
+        node_kind[bfs_i] = k
+        node_lo[bfs_i]   = lo
+        node_hi[bfs_i]   = hi
 
-    return ivs
+        dim   = int(sd[bfs_i])
+        stype = int(st[bfs_i])
+        if dim < 0:
+            continue
+
+        if stype == 0:   # CONST → LINEAR: child gets LINEAR in dim
+            ck = k.copy(); ck[dim] = LINEAR
+            cl = lo.copy(); ch = hi.copy()
+            queue.append((bfs_left(bfs_i), ck, cl, ch))
+
+        elif stype == 1:  # LINEAR → HAT(0, 1)
+            ck = k.copy(); ck[dim] = HAT
+            cl = lo.copy(); cl[dim] = 0.0
+            ch = hi.copy(); ch[dim] = 1.0
+            queue.append((bfs_left(bfs_i), ck, cl, ch))
+
+        else:             # HAT split at midpoint
+            m = (lo[dim] + hi[dim]) / 2.0
+            lk = k.copy(); ll = lo.copy(); lh = hi.copy(); lh[dim] = m
+            rk = k.copy(); rl = lo.copy(); rh = hi.copy(); rl[dim] = m
+            queue.append((bfs_left(bfs_i),  lk, ll, lh))
+            queue.append((bfs_right(bfs_i), rk, rl, rh))
+
+    return node_kind, node_lo, node_hi
 
 
 # ── JAX evaluation ────────────────────────────────────────────────────────────
 
 @jax.jit
 def eval_basis_jax(
-    x: jnp.ndarray,
-    node_intervals: jnp.ndarray,
-    leaf_mask: jnp.ndarray,
+    x:           jnp.ndarray,
+    node_kind:   jnp.ndarray,
+    node_lo:     jnp.ndarray,
+    node_hi:     jnp.ndarray,
+    active_mask: jnp.ndarray,
 ) -> jnp.ndarray:
     """
-    Evaluate all active (leaf) basis functions at point x.
+    Evaluate all active basis functions at point x.
 
     Parameters
     ----------
-    x              : (D,) evaluation point
-    node_intervals : (max_nodes, D, 2) precomputed interval table
-    leaf_mask      : (max_nodes,) bool — True for leaf nodes
+    x           : (D,) evaluation point
+    node_kind   : (max_nodes, D) int32 — 0=CONST, 1=LINEAR, 2=HAT
+    node_lo     : (max_nodes, D) float
+    node_hi     : (max_nodes, D) float
+    active_mask : (max_nodes,) bool
 
     Returns
     -------
-    phi : (max_nodes,) float — phi_i(x) for active leaves, 0 for non-leaves.
-          Use  jnp.dot(jnp.where(leaf_mask, rates, 0.0), phi)  to get
-          the log-intensity at x.
+    phi : (max_nodes,) float — phi_i(x); 0 for absent nodes
     """
-    def eval_one_node(iv):
-        lo    = iv[:, 0]          # (D,)
-        hi    = iv[:, 1]
-        w     = hi - lo
-        mid   = lo + w / 2.0
-        rising  = 2.0 * (x - lo) / w
-        falling = 2.0 * (hi - x) / w
-        val   = jnp.where(x <= mid, rising, falling)
-        val   = jnp.where((x < lo) | (x > hi), 0.0, val)
-        return jnp.prod(val)
+    def eval1d(kind_d, lo_d, hi_d, x_d):
+        w       = hi_d - lo_d
+        mid     = lo_d + w / 2.0
+        rising  = 2.0 * (x_d - lo_d) / w
+        falling = 2.0 * (hi_d - x_d) / w
+        hat_val = jnp.where(x_d <= mid, rising, falling)
+        hat_val = jnp.where((x_d < lo_d) | (x_d > hi_d), 0.0, hat_val)
+        return jnp.where(kind_d == CONST, 1.0,
+               jnp.where(kind_d == LINEAR, x_d, hat_val))
 
-    all_evals = jax.vmap(eval_one_node)(node_intervals)   # (max_nodes,)
-    return jnp.where(leaf_mask, all_evals, 0.0)
+    def eval_node(kinds, los, his):
+        per_dim = jax.vmap(eval1d)(kinds, los, his, x)
+        return jnp.prod(per_dim)
+
+    all_evals = jax.vmap(eval_node)(node_kind, node_lo, node_hi)
+    return jnp.where(active_mask, all_evals, 0.0)
 
 
 @jax.jit
 def design_matrix_jax(
-    X: jnp.ndarray,
-    node_intervals: jnp.ndarray,
-    leaf_mask: jnp.ndarray,
+    X:           jnp.ndarray,
+    node_kind:   jnp.ndarray,
+    node_lo:     jnp.ndarray,
+    node_hi:     jnp.ndarray,
+    active_mask: jnp.ndarray,
 ) -> jnp.ndarray:
     """
     Design matrix Phi[i, j] = phi_j(X[i]).
 
     Parameters
     ----------
-    X              : (n_pts, D)
-    node_intervals : (max_nodes, D, 2)
-    leaf_mask      : (max_nodes,) bool
+    X           : (n_pts, D)
+    node_kind   : (max_nodes, D) int32
+    node_lo     : (max_nodes, D) float
+    node_hi     : (max_nodes, D) float
+    active_mask : (max_nodes,) bool
 
     Returns
     -------
     Phi : (n_pts, max_nodes) float
     """
-    return jax.vmap(eval_basis_jax, in_axes=(0, None, None))(
-        X, node_intervals, leaf_mask
+    return jax.vmap(eval_basis_jax, in_axes=(0, None, None, None, None))(
+        X, node_kind, node_lo, node_hi, active_mask
     )
 
 
 # ── RJMCMC helpers (Python-level) ────────────────────────────────────────────
 
 def splittable_leaves(tree_state: TreeState) -> np.ndarray:
-    """
-    BFS indices of leaf nodes whose children would fit within max_nodes.
-    These are the birth-move candidates.
-    """
+    """BFS indices of leaf nodes whose children would fit within max_nodes."""
     mn  = tree_state.max_nodes
     idx = tree_state.leaf_bfs_indices()
-    return idx[2 * idx + 2 < mn]        # bfs_right(i) = 2i+2
+    return idx[2 * idx + 2 < mn]
 
 
 def mergeable_internals(tree_state: TreeState) -> np.ndarray:
-    """
-    BFS indices of internal nodes whose both children are leaves.
-    These are the death-move candidates.
-    """
+    """BFS indices of internal nodes whose all children are leaves."""
     sd  = np.array(tree_state.split_dim)
+    st  = np.array(tree_state.split_type)
     rt  = np.array(tree_state.rates)
     mn  = tree_state.max_nodes
     out = []
     for i in np.where(sd >= 0)[0]:
-        li, ri = bfs_left(int(i)), bfs_right(int(i))
-        if (ri < mn
-                and sd[li] < 0 and np.isfinite(rt[li])
-                and sd[ri] < 0 and np.isfinite(rt[ri])):
-            out.append(int(i))
+        li = bfs_left(int(i))
+        ri = bfs_right(int(i))
+        if li >= mn or sd[li] >= 0 or not np.isfinite(rt[li]):
+            continue
+        if int(st[i]) == 2:
+            if ri >= mn or sd[ri] >= 0 or not np.isfinite(rt[ri]):
+                continue
+        out.append(int(i))
     return np.array(out, dtype=int)
