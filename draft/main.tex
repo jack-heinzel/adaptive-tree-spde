@@ -1429,13 +1429,17 @@ simplices.  Two obstacles make this approach untenable in dimensions $D \ge 3$
 or even in $D=2$ once adaptive resolution is required.
 
 \paragraph{Combinatorial explosion of simplices.}
-The number of Delaunay simplices needed to triangulate $[0,1]^D$ grows at
-least as fast as $D!$ in the number of vertices (and this lower bound is
-believed to be tight, though the precise asymptotics remain an open problem in
-combinatorics~\citep{devadoss2011discrete}).  Concretely, a regular grid of
-$n^D$ points in $D$ dimensions produces $O(n^D \cdot D!)$ simplices: already
-for $D=4$ and a modest $n=10$ this yields millions of simplices.  FEM matrix
-assembly over all of them is prohibitive.
+The standard Freudenthal--Kuhn triangulation of $[0,1]^D$ decomposes the
+hypercube into exactly $D!$ simplices, one per permutation of the coordinate
+axes~\citep{freudenthal1942}.  More efficient triangulations exist: the best
+known construction achieves roughly $(0.816)^D \cdot D!$ simplices
+\citep{ordensantos2003}, and current lower bounds~\citep{glazyrin2012} are
+weaker still.  The precise minimum (the \emph{simplexity} of the $D$-cube)
+remains an open problem in combinatorial geometry.  In any case all known
+constructions and lower bounds grow super-exponentially in $D$: for $D=4$ the
+Freudenthal triangulation already uses $4! = 24$ top-dimensional simplices per
+unit hypercube, so a grid of $n^D$ points produces $O(n^D \cdot D!)$ simplices
+and FEM matrix assembly over all of them is prohibitive.
 
 \paragraph{Non-stationarity of the triangulation under refinement.}
 Adaptive resolution requires adding new vertices to the mesh.  Inserting a
