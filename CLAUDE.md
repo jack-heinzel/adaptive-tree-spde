@@ -51,6 +51,17 @@ The LaTeX document in `draft/` functions as a **lab notebook**: it documents
 experiments, derives the mathematics, and records design decisions as they are
 made.  It is not a polished paper.
 
+**Compilation happens on Overleaf**, not locally — the draft is attached to an
+Overleaf project.  Do not attempt to `pdflatex`/`latexmk` it locally to "verify"
+(the local TeX install is missing packages such as `algpseudocode`, so it will
+fail for environmental reasons unrelated to the edit).  Edit `main.tex` directly
+and let the user compile on Overleaf.  When changing structure, sanity-check
+`\ref`/`\label` consistency by inspection rather than by building.
+
+The document centres on the **adaptive tree hat basis** on $[0,1]^D$
+(`\label{sec:hat-tree}`) as the primary method; the Delaunay-triangulation FEM
+pipeline is retained as the demoted Level-1 baseline (`\label{sec:baseline}`).
+
 **Appendix: Lessons Learned and Paths Avoided** (`\label{sec:lessons}`) is a
 running record of approaches that were explored and ruled out, together with the
 reason why.  Whenever a promising direction turns out to be a dead end, add an

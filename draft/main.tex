@@ -27,7 +27,7 @@
 \newcommand{\bphi}{\boldsymbol{\phi}}
 
 \title{Bayesian Inference for Inhomogeneous Poisson Processes\\
-via Adaptive FEM Triangulation and the Mat\'ern SPDE}
+via an Adaptive Tree Hat Basis for the Mat\'ern SPDE}
 \author{Jack Heinzel}
 \date{Draft --- \today}
 
@@ -40,13 +40,23 @@ inhomogeneous Poisson process over a $d$-dimensional domain.
 The log-intensity is modelled as a Gaussian random field whose prior is derived
 from the stochastic partial differential equation (SPDE) representation of the
 Mat\'ern covariance family \citep{lindgren2011}.
-The field is discretised on an adaptive triangulation driven by the observed
-point pattern, assembled with finite element methods (FEM), and sampled jointly
-with the hyperparameters $(\kappa, \sigma, \mu)$ using the No-U-Turn Sampler
-(NUTS) implemented in BlackJAX.
-We discuss several implementation subtleties: the domain-area correction for
-buffer nodes, an $O(n)$ eigenvalue trick for the log-determinant, and a centred
-parameterisation that eliminates Neal's funnel.
+The central object of this note is an \emph{adaptive tree hat basis} on
+$[0,1]^D$: a hierarchical, multi-resolution basis built from tensor products of
+one-dimensional constant, linear, and dyadic hat functions, refined where the
+observed point pattern is dense.  This basis yields finite element (FEM) mass
+and stiffness matrices in closed form --- the stiffness matrix is diagonal and
+the mass matrix has a recursive block structure --- and, crucially, refines
+\emph{locally} ($O(D)$ work per node) without rebuilding any global mesh.  The
+field is assembled with FEM and sampled jointly with the hyperparameters
+$(\kappa, \sigma, \mu)$ using gradient-based MCMC (NUTS in BlackJAX, plus
+dimension-robust pCN and Hilbert-space HMC), with reversible-jump moves over the
+refinement tree.
+A Delaunay triangulation pipeline is retained as the Level-1 baseline
+(Section~\ref{sec:baseline}); the lessons appendix records why the tree basis
+superseded it.
+We also discuss several implementation subtleties: the domain-area correction
+for buffer nodes, an $O(n)$ eigenvalue trick for the log-determinant, and a
+centred parameterisation that eliminates Neal's funnel.
 \end{abstract}
 
 \tableofcontents
@@ -117,42 +127,16 @@ intensity fields that vary by one or more log-units.  Including a free scale
 parameter $\sigma$ (Section~\ref{sec:hyperparams}) is therefore essential.
 
 % ============================================================
-\section{Adaptive Triangulation}
-\label{sec:adaptive-tri}
-% ============================================================
-
-\subsection{Recursive Equal-Count kd-Tree}
-
-We build a mesh that is automatically denser where the observed point pattern is
-dense.  Starting from a root cell covering the domain, we recursively split
-each cell along its longest axis at the data median until every leaf cell
-contains at most $n_{\max}$ points (the refinement threshold).  This is a
-\emph{balanced} kd-tree partition: each split divides the data approximately
-evenly, so the resulting leaf sizes are $O(n/n_{\rm leaves})$.
-
-The split value is clamped away from the cell boundary by a relative tolerance
-$\epsilon = 10^{-8}$ of the cell width, ensuring no degenerate child cell.
-
-\subsection{Mesh Nodes and Delaunay Triangulation}
-
-Each leaf cell contributes one node to the mesh: the centroid of its data
-points if the cell is non-empty, or the geometric cell midpoint otherwise.
-The $2^d$ corners of the bounding box are added as fixed boundary nodes.
-
-The Delaunay triangulation of all nodes defines the mesh $\mathcal{T}$.
-It is rebuilt from scratch after each refinement or coarsening step.
-
-\subsection{Buffer Region}
-
-To ensure the triangulation is regular near the domain boundary, the bounding
-box is taken slightly larger than the observation domain---typically
-$[-0.1, 1.1]^2$ when observations lie in $[0,1]^2$.  This introduces
-\emph{buffer nodes} in the extended region.  We account for them explicitly in
-the likelihood (Section~\ref{sec:obs-bounds}).
-
-% ============================================================
 \section{FEM Discretisation}
 % ============================================================
+
+This section sets up the finite element machinery in a \emph{basis-agnostic}
+way: the Galerkin weak form and the precision matrix $Q$ are written in terms of
+a generic mass matrix $C$ and stiffness matrix $G$, independent of how the basis
+$\{\phi_j\}$ is constructed.  The concrete closed forms for $C$ and $G$ used
+throughout this note come from the adaptive tree hat basis of
+Section~\ref{sec:hat-tree}; the Delaunay-triangulation baseline of
+Section~\ref{sec:baseline} supplies an alternative set of the same matrices.
 
 \subsection{Galerkin Weak Form}
 \label{sec:galerkin}
@@ -188,7 +172,8 @@ The Laplacian term is handled by \emph{integration by parts}
 where the boundary term vanishes.  This step is essential: $\phi_i$ is
 piecewise linear and its second derivatives are zero almost everywhere, so the
 left side of \eqref{eq:ibp} would be unusable; the right side requires only
-first derivatives, which are constant and well-defined on each simplex.
+first derivatives, which are well-defined on each element of the discretisation
+(each dyadic cell of the tree basis, or each simplex of a triangulation).
 
 Substituting \eqref{eq:fem-approx} into the left-hand side of
 \eqref{eq:galerkin-condition} and collecting:
@@ -210,126 +195,11 @@ The Galerkin system is therefore the discrete stochastic equation
   \label{eq:galerkin-system}
 \end{equation}
 with $K=\kappa^2 C+G$ assembling the two bilinear forms identified in
-\eqref{eq:lhs}.  Sections~\ref{sec:mass}--\ref{sec:stiffness} define $C$ and $G$
-explicitly; Section~\ref{sec:spde-op} derives the precision matrix from
-\eqref{eq:galerkin-system}.
-
-\subsection{Basis Functions and Local Geometry}
-
-On the triangulation $\mathcal{T}$ with $m$ nodes and $T$ simplices, we use
-piecewise linear \emph{hat} basis functions $\{\phi_i\}_{i=1}^m$.  The hat
-function $\phi_j$ equals 1 at node $j$, 0 at every other node, and varies
-linearly in between.  Within any single simplex it is a flat tilted plane, so
-its gradient is \emph{constant} on each simplex and can be computed from
-geometry alone.
-
-\paragraph{Reference simplex and the map $B_\tau$.}
-Every computation is carried out on a fixed \emph{reference simplex}
-$\hat\tau$ with vertices at the origin $\hat{v}_0=\mathbf{0}$ and the
-standard basis vectors $\hat{v}_k = e_k$ for $k=1,\ldots,d$.  On this
-template the hat functions are trivially
-\[
-  \hat\phi_0(\hat s) = 1 - \hat s_1 - \cdots - \hat s_d, \qquad
-  \hat\phi_k(\hat s) = \hat s_k \;\;(k\ge 1),
-\]
-with reference gradients $\nabla_{\hat s}\hat\phi_j = \hat{e}_j$, where
-$\hat{e}_0 = -\mathbf{1}$ and $\hat{e}_k$ is the $k$-th standard basis
-vector.
-
-The matrix
-\begin{equation}
-  B_\tau = [v_1 - v_0, \;\ldots\;, v_d - v_0] \in \R^{d\times d}
-\end{equation}
-maps the reference simplex to the physical simplex $\tau$ via
-$s = v_0 + B_\tau\hat s$.  Its columns are the edge vectors of $\tau$
-emanating from $v_0$, so $B_\tau$ encodes the shape and orientation of the
-triangle.  The volume follows immediately: $|\tau| = |\det B_\tau|/d!$.
-
-\paragraph{Why $B_\tau^{-\top}$ for gradients.}
-The gradient $\nabla_s\phi_j^{(\tau)}$ is the vector $g$ satisfying
-$g\cdot\delta s = \delta\phi$ for every physical displacement $\delta s$.
-Writing $\delta s = B_\tau\,\delta\hat s$ and using the reference gradient
-$\nabla_{\hat s}\hat\phi_j = \hat{e}_j$:
-\[
-  g \cdot B_\tau\,\delta\hat s
-  = \hat{e}_j \cdot \delta\hat s
-  \quad\text{for all }\delta\hat s,
-\]
-which gives $B_\tau^{\top}g = \hat{e}_j$, and therefore
-\begin{equation}
-  \nabla_s \phi_j^{(\tau)} = B_\tau^{-\top}\hat{e}_j, \quad j = 0, \ldots, d.
-  \label{eq:grad-phi}
-\end{equation}
-Intuitively, $B_\tau^{-1}$ converts a physical direction into reference
-coordinates, and the transpose accounts for the fact that gradients scale
-inversely with distances (a squeezed triangle has steeper slopes).  Because
-$B_\tau$ is constant on $\tau$, so is $\nabla_s\phi_j^{(\tau)}$: the hat
-function is a flat ramp, and \eqref{eq:grad-phi} gives its slope.
-
-\subsection{Mass Matrix}
-\label{sec:mass}
-
-The mass matrix $C \in \R^{m\times m}$ has entries
-\begin{equation}
-  C_{ij} = \int_\mathcal{D} \phi_i(s)\phi_j(s) \dd s
-         = \sum_{\tau \ni i,j} |\tau| \frac{1 + \delta_{ij}}{(d+1)(d+2)}.
-  \label{eq:mass}
-\end{equation}
-$C_{ij}$ measures the \emph{overlap} between hat functions $\phi_i$ and
-$\phi_j$: it is nonzero only when nodes $i$ and $j$ share at least one
-simplex.  The diagonal entry $C_{ii}$ is proportional to the total area of
-all simplices containing node $i$.  The matrix is symmetric positive definite
-with sparsity matching the mesh topology.
-
-The \emph{row sum} $\tilde{c}_j = (C\mathbf{1})_j = \sum_k C_{jk}$ is the
-total area ``owned'' by node $j$: it equals $\sum_{\tau\ni j}|\tau|/(d+1)$,
-the average share of each incident simplex.  Geometrically, $\tilde{c}_j$
-approximates the area of the Voronoi cell\footnote{It's not really a Voronoi cell, but it's close-ish to one depending on the triangulation.} around node $j$.  The diagonal
-matrix $\tilde{C} = \diag(C\mathbf{1})$ is the \emph{lumped} mass matrix,
-used in Section~\ref{sec:integral-approx} to approximate the Poisson integral
-as a weighted sum $\sum_j \tilde{c}_j \lambda_j$.
-
-In the SPDE operator $(\kappa^2 - \Delta)$, the term $\kappa^2$ acts like a
-scalar multiple of the identity on functions.  After Galerkin projection onto
-the hat-function basis, this becomes $\kappa^2 C$: the mass matrix is the
-FEM discretisation of the identity operator, weighted by local area.
-
-\subsection{Stiffness Matrix}
-\label{sec:stiffness}
-
-The stiffness matrix $G \in \R^{m\times m}$ has entries
-\begin{equation}
-  G_{ij} = \int_\mathcal{D} \nabla\phi_i(s) \cdot \nabla\phi_j(s) \dd s
-         = \sum_{\tau \ni i,j} |\tau| \, \nabla\phi_i^{(\tau)} \cdot \nabla\phi_j^{(\tau)}.
-  \label{eq:stiff}
-\end{equation}
-$G_{ij}$ measures how much nodes $i$ and $j$ \emph{resist spatial variation}
-together: it is the inner product of the slopes of the two hat functions.
-By integration by parts, $\mathbf{x}^T G\, \mathbf{x} =
-\int|\nabla x(s)|^2\dd s$, so the quadratic form in $G$ is exactly the total
-squared-gradient energy of the piecewise-linear field
-$x(s)=\sum_j x_j\phi_j(s)$.  Smooth fields (small gradients everywhere) have
-low $G$-energy; rough or wiggly fields have high $G$-energy.
-
-Equivalently, $G$ discretises the negative Laplacian $-\Delta$: it can be
-thought of as a network of \emph{springs} connecting adjacent nodes, where
-$G_{ij}$ is (minus) the spring constant for the edge between $i$ and $j$.
-For a Delaunay mesh in 2D, $G_{ij} \le 0$ for all neighbours
-($i\neq j$), and the action $(G\mathbf{x})_i = -\sum_j G_{ij}(x_j - x_i)$
-sums the spring forces pulling node $i$ toward its neighbours' values.
-
-Together, $K = \kappa^2 C + G$ discretises $(\kappa^2 - \Delta)$: the mass
-term $\kappa^2 C$ penalises large \emph{absolute} values of the field, and
-the stiffness term $G$ penalises spatial \emph{roughness}.  Large $\kappa$
-makes the mass term dominate, producing a field with short correlation length
-(rapidly decorrelated); small $\kappa$ lets the stiffness term dominate,
-producing a smoother field correlated over longer distances.
-
-For the generalised case \eqref{eq:spde-gen}, the integrand becomes
-$\nabla\phi_i^T H(\bar\tau) \nabla\phi_j$ where $H$ is evaluated at the
-simplex centroid $\bar\tau$: the anisotropic diffusion tensor $H$ stretches
-the spring network directionally, making correlations longer in some
-directions than others.
+\eqref{eq:lhs}.  Section~\ref{sec:spde-op} derives the precision matrix from
+\eqref{eq:galerkin-system}; the concrete mass and stiffness matrices $C$ and $G$
+for the adaptive tree basis are given in
+Sections~\ref{sec:hat-mass}--\ref{sec:hat-stiffness}
+(and for the triangulation baseline in Section~\ref{sec:baseline}).
 
 \subsection{SPDE Operator and Precision Matrix}
 \label{sec:spde-op}
@@ -370,519 +240,14 @@ For general $\alpha\ge 1$,
 \end{equation}
 
 % ============================================================
-\section{Likelihood Discretisation}
-% ============================================================
-
-\subsection{Observation Matrix}
-
-For observation $s_i$ lying in simplex $\tau(i)$ with vertices
-$v_0^{(i)}, \ldots, v_d^{(i)}$, let $\lambda_i = (\lambda_{v_0^{(i)}}, \ldots,
-\lambda_{v_d^{(i)}})$ be the nodal values.  By piecewise linear interpolation,
-\begin{equation}
-  \log\hat\lambda(s_i) = \mu + \sum_{j=0}^{d} b_{ij} \, x_{v_j^{(i)}},
-\end{equation}
-where $b_{ij} \ge 0$ are the barycentric coordinates of $s_i$ in $\tau(i)$.
-
-The sum term in \eqref{eq:poisson-ll} becomes $\sum_i x_{v_j^{(i)}} b_{ij} = A\bx$
-where $A \in \R^{n \times m}$ is the sparse barycentric projection matrix.
-Because the $i$-th row of $A$ is the barycentric coordinates of $s_i$, and
-since barycentric coordinates sum to one, the log-likelihood can be written as
-\begin{equation}
-  \sum_{i=1}^n \log\lambda(s_i) = n\mu + \mathbf{d}^T \bx,
-  \label{eq:data-term}
-\end{equation}
-where the \emph{data-accumulation vector} $\mathbf{d} \in \R^m$ is
-$d_j = \sum_{i : v_j \in \tau(i)} b_{ij}$, assembled by scattering barycentric
-weights to their respective nodes.
-
-\subsection{Integral Approximation and Lumped Mass Quadrature}
-
-The integral $\int_\mathcal{D} \lambda(s) \dd s$ is approximated by a
-nodal quadrature rule.  Expanding $\lambda(s) = \exp(\mu + x(s))$ and
-integrating the piecewise linear interpolant gives
-\begin{equation}
-  \int_\mathcal{D} \exp\!\bigl(\mu + x(s)\bigr) \dd s
-  \approx \sum_{j=1}^m c_j \exp(\mu + x_j),
-  \qquad c_j = \int_\mathcal{D} \phi_j(s) \dd s = \tilde{C}_{jj}.
-  \label{eq:integral-approx}
-\end{equation}
-The lumped weights $c_j = \tilde{C}_{jj} = (C\mathbf{1})_j$ equal the area
-contributed to node $j$ across all incident simplices, specifically
-$c_j = \sum_{\tau \ni j} |\tau|/(d+1)$.
-
-\subsection{Domain Correction for Buffer Nodes}
-\label{sec:obs-bounds}
-
-When the mesh bounding box $\hat{\mathcal{D}}$ is larger than the observation
-domain $\mathcal{D}_{\rm obs}$, the buffer nodes $j \notin \mathcal{D}_{\rm obs}$
-have $c_j > 0$ but lie outside the region over which the Poisson likelihood is
-defined.  Including them inflates the integral, biasing $\mu$ downward.
-
-The fix is to zero the lumped weights for buffer nodes before forming the integral:
-\begin{equation}
-  \tilde{c}_j = c_j \cdot \mathbf{1}[s_j \in \mathcal{D}_{\rm obs}].
-  \label{eq:obs-bounds}
-\end{equation}
-With this correction, the likelihood integral is $\sum_j \tilde{c}_j \exp(\mu+x_j)$,
-which integrates only over the observation domain.
-
-\subsection{Posterior Normalization Property}
-\label{sec:gamma-posterior}
-
-\begin{proposition}
-Under a flat prior $p(\mu) \propto 1$ and the LGCP likelihood \eqref{eq:poisson-ll}
-with the quadrature \eqref{eq:integral-approx}, the conditional posterior of the
-expected total count $N = \sum_j \tilde{c}_j \exp(\mu + x_j)$, given $\bx$, is
-$\mathrm{Gamma}(n, 1)$ with mean $n$.
-\end{proposition}
-
-\begin{proof}
-Let $Z(\bx) = \sum_j \tilde{c}_j e^{x_j}$.  The log-posterior in $\mu$,
-$p(\mu \mid \bx, \{s_i\}) \propto \exp(n\mu - Z(\bx) e^\mu)$,
-is the kernel of a $\mathrm{Gamma}(n, 1/Z(\bx))$ distribution on
-$N = Z(\bx)e^\mu$.  Hence $\E[N \mid \bx] = n$ for any realization of
-$\bx$.
-\end{proof}
-
-This property provides a useful diagnostic: after sampling, the posterior mean
-of $\sum_j \tilde{c}_j \exp(\hat\mu + \hat x_j)$ should equal $n$.  Without
-the domain correction~\eqref{eq:obs-bounds}, the guarantee holds for the full
-mesh domain $\hat{\mathcal{D}}$ rather than $\mathcal{D}_{\rm obs}$.
-
-% ============================================================
-\section{Joint Inference for Hyperparameters}
-\label{sec:hyperparams}
-% ============================================================
-
-\subsection{Parameterisation and Prior}
-
-We infer $(\mu, \kappa, \sigma, \bx)$ jointly.  The model is
-\begin{align}
-  \log\kappa &\sim \mathcal{N}(\mu_\kappa, \sigma_\kappa^2), \\
-  \log\sigma  &\sim \mathcal{N}(\mu_\sigma, \sigma_\sigma^2), \\
-  \bx \mid \kappa, \sigma &\sim \mathcal{N}(0,\; \sigma^2 Q(\kappa)^{-1}), \\
-  \{s_i\} \mid \mu, \bx &\sim \text{LGCP with } \log\lambda = \mu + \bx.
-  \label{eq:model}
-\end{align}
-
-\subsection{Centred Parameterisation to Avoid Neal's Funnel}
-\label{sec:centred}
-
-A non-centred parameterisation $\bx = \sigma \tilde\bx$ with
-$\tilde\bx \sim \mathcal{N}(0, Q^{-1})$ creates a \emph{Neal's funnel}
-\citep{neal2003slice}: the joint distribution
-$({\sigma, \tilde\bx})$ and $(2\sigma, \tilde\bx/2)$ produce nearly identical
-likelihood values, yet the prior on $\tilde\bx$ \emph{improves} as
-$\tilde\bx \to 0$, giving the sampler a free gradient towards $\sigma \to \infty$
-with $\tilde\bx \to 0$.  Traces of $\log\sigma$ diverge.
-
-The \emph{centred parameterisation} resolves this by working directly with
-$\bx$ in \eqref{eq:model}.  The prior log-density is
-\begin{equation}
-  \log p(\bx \mid \kappa, \sigma) =
-    -\frac{1}{2\sigma^2} \bx^T Q \bx
-    + \tfrac{1}{2}\log|Q|
-    - m \log\sigma
-    + \text{const},
-  \label{eq:log-prior-x}
-\end{equation}
-where the $-m\log\sigma$ term (the Jacobian for the change-of-variables
-$\bx \to \tilde\bx = \bx/\sigma$) strongly penalises large $\sigma$.
-For $m \approx 130$ nodes, increasing $\sigma$ by a factor of 10 costs
-$130 \log 10 \approx 299$ log-units in prior density.
-
-\subsection{Log-Determinant via Generalised Eigenvalues}
-\label{sec:logdet}
-
-The log-prior \eqref{eq:log-prior-x} requires $\log|Q(\kappa)| = 2\log|K(\kappa)| - \log|\tilde{C}|$.
-Recomputing $\log|K|$ at every MCMC step via Cholesky costs $O(m^3)$ per
-iteration.  We reduce this to $O(m)$ via the spectral decomposition.
-
-\begin{proposition}[Eigenvalue log-det trick]
-Let $G v_i = \mu_i C v_i$ be the generalised eigenproblem (computed once,
-$O(m^3)$).  Then for any scalar $\kappa$,
-\begin{equation}
-  \log|K(\kappa)| = \log|C| + \sum_{i=1}^m \log(\kappa^2 + \mu_i).
-  \label{eq:logdet-trick}
-\end{equation}
-\end{proposition}
-
-\begin{proof}
-Factorise $K = \kappa^2 C + G = C(\kappa^2 I + C^{-1}G)$.  Then
-$\log|K| = \log|C| + \log|\kappa^2 I + C^{-1}G|$.
-The matrix $C^{-1}G$ has eigenvalues $\mu_i$, so
-$\log|\kappa^2 I + C^{-1}G| = \sum_i \log(\kappa^2 + \mu_i)$.
-\end{proof}
-
-The eigenpairs $\{(\mu_i, v_i)\}$ are computed once before sampling via
-\texttt{scipy.linalg.eigh}; within BlackJAX, \eqref{eq:logdet-trick} reduces
-the log-determinant evaluation to a single sum over eigenvalues.
-
-\begin{remark}
-This trick requires scalar $\kappa$.  For non-stationary fields where
-$\kappa(s)$ varies, the pencil $K(\kappa) = \diag(\kappa^2)C + G$ is no longer
-a polynomial in a single scalar, and stochastic Lanczos quadrature (SLQ) would
-be needed instead.
-\end{remark}
-
-\subsection{Full Log-Posterior}
-
-Combining all terms, the log-posterior to be sampled is
-\begin{align}
-  \log p(\mu, \log\kappa, \log\sigma, \bx \mid \{s_i\})
-  &= \underbrace{n\mu + \mathbf{d}^T \bx - \sum_j \tilde{c}_j e^{\mu+x_j}}_{\text{Poisson likelihood}} \notag \\
-  &\quad - \underbrace{\frac{1}{2\sigma^2}\bx^T Q \bx + \frac{1}{2}\log|Q| - m\log\sigma}_{\text{SPDE prior on } \bx}
-  \label{eq:log-posterior} \\
-  &\quad - \underbrace{\frac{(\log\kappa - \mu_\kappa)^2}{2\sigma_\kappa^2}
-         + \frac{(\log\sigma - \mu_\sigma)^2}{2\sigma_\sigma^2}}_{\text{hyperparameter priors}}. \notag
-\end{align}
-
-% ============================================================
-\section{Stationary Anisotropic Extension}
-\label{sec:anisotropic}
-% ============================================================
-
-\subsection{Anisotropy Matrix Parameterisation}
-
-The isotropic model (Section~\ref{sec:hyperparams}) treats all directions
-equally through a scalar range parameter $\kappa$.  A stationary
-\emph{anisotropic} generalisation retains a constant diffusion tensor $H$ in
-\eqref{eq:spde-gen}.  In $\R^2$ we parameterise
-\begin{equation}
-  H = R(\theta)\,\diag(\kappa_x^2,\,\kappa_y^2)\,R(\theta)^T,
-  \label{eq:H-param}
-\end{equation}
-where $R(\theta)$ is the $2\times 2$ rotation matrix and $\kappa_x, \kappa_y > 0$
-are effective range parameters along the principal axes of the field.
-The elements of $H$ are
-\begin{align}
-  h_{11} &= \kappa_x^2\cos^2\!\theta + \kappa_y^2\sin^2\!\theta, \nonumber\\
-  h_{12} &= (\kappa_x^2 - \kappa_y^2)\cos\theta\sin\theta,           \label{eq:H-components} \\
-  h_{22} &= \kappa_x^2\sin^2\!\theta + \kappa_y^2\cos^2\!\theta.    \nonumber
-\end{align}
-The three parameters $(\log\kappa_x,\, \log\kappa_y,\, \theta)$ replace the
-single scalar $\log\kappa$ from the isotropic model; the marginal variance
-$\sigma$ remains a scalar.  The isotropic case is recovered by setting
-$\kappa_x = \kappa_y$ (any $\theta$), yielding $H = \kappa_x^2 I$.
-
-\subsection{FEM Basis Decomposition}
-\label{sec:aniso-fem}
-
-The anisotropic stiffness matrix
-\[
-G_{H,ij} = \int_\mathcal{D} \nabla\phi_i^T H\,\nabla\phi_j\,\dd s
-\]
-decomposes linearly over three basis matrices:
-\begin{equation}
-  G_H = h_{11}\,G_{xx} + h_{12}\,G_{xy} + h_{22}\,G_{yy},
-  \label{eq:GH-decomp}
-\end{equation}
-with
-\begin{align}
-  G_{xx,ij} &= \sum_\tau |\tau|\,
-    \partial_x\phi_i^{(\tau)}\,\partial_x\phi_j^{(\tau)}, \\
-  G_{yy,ij} &= \sum_\tau |\tau|\,
-    \partial_y\phi_i^{(\tau)}\,\partial_y\phi_j^{(\tau)}, \\
-  G_{xy,ij} &= \sum_\tau |\tau|\!\left(
-    \partial_x\phi_i^{(\tau)}\,\partial_y\phi_j^{(\tau)}
-    + \partial_y\phi_i^{(\tau)}\,\partial_x\phi_j^{(\tau)}\right).
-\end{align}
-All three matrices are assembled once from the fixed mesh prior to sampling and
-stored in COO sparse format.  The isotropic $G = G_{xx} + G_{yy}$ is the
-special case $H = I$.
-
-At each NUTS step, forming $G_H$ costs three sparse scalar-matrix additions, and
-the SPDE operator
-\begin{equation}
-  K(H) = C + G_H(H)
-  \label{eq:K-aniso}
-\end{equation}
-has the same sparsity pattern as the isotropic $K(\kappa)$.  Matrix--vector
-products $K(H)\bx$ therefore cost $O(\mathrm{nnz}) \approx O(m)$ via COO
-scatter-add, unchanged from the isotropic case.
-
-\subsection{Log-Determinant Challenge}
-\label{sec:logdet-aniso}
-
-Section~\ref{sec:logdet} showed that for the isotropic operator $K(\kappa) =
-\kappa^2 C + G$, the log-determinant reduces to $O(m)$ work per step once the
-generalised eigenpairs $G v_i = \mu_i C v_i$ have been precomputed:
-\[
-  \log|K(\kappa)| = \log|C| + \textstyle\sum_i \log(\kappa^2 + \mu_i).
-\]
-This is possible because $K$ is a \emph{scalar-affine} function of the single
-parameter $\kappa^2$: the eigenvectors $\{v_i\}$ are fixed and only the
-eigenvalues shift.
-
-For the anisotropic operator \eqref{eq:K-aniso}, the matrix
-$K(H) = C + h_{11}G_{xx} + h_{12}G_{xy} + h_{22}G_{yy}$
-is a linear combination of four sparse matrices whose coefficients
-$(h_{11}, h_{12}, h_{22})$ all change at every NUTS step.  No fixed eigenbasis
-can diagonalise $K(H)$ for all $H$ simultaneously: a generalised eigenproblem
-$K(H) v = \mu C v$ would need to be resolved whenever $(h_{11}, h_{12}, h_{22})$
-changes.
-
-Consequently, evaluating $\log|K(H)|$ requires a dense factorisation at each
-leapfrog step,
-\begin{equation}
-  \log|K(H)| = \texttt{slogdet}\bigl(K(H)\bigr),
-  \quad\text{cost } O(m^3) \text{ per step.}
-  \label{eq:slogdet-aniso}
-\end{equation}
-The gradient required by NUTS,
-\begin{equation}
-  \frac{\partial\log|K|}{\partial\theta_k}
-  = \tr\!\left(K^{-1}\frac{\partial K}{\partial\theta_k}\right),
-  \label{eq:grad-logdet-aniso}
-\end{equation}
-requires an implicit $K^{-1}$ solve for each of the three anisotropy
-parameters $(\log\kappa_x, \log\kappa_y, \theta)$, which JAX's automatic
-differentiation of \texttt{jnp.linalg.slogdet} provides via the implicit
-function theorem, again at $O(m^3)$ cost.
-
-For meshes of size $m \lesssim 500$ the per-step $O(m^3)$ cost is acceptable
-($\approx\!1$\,ms on a modern CPU), but it precludes scaling to
-$m \gtrsim 2000$.  Finding an efficient $O(m)$--$O(m\log m)$ approximation
-to $\log|K(H)|$ for parametric matrix pencils is an \textbf{open problem}.
-
-\begin{remark}[Stochastic Lanczos quadrature]
-One promising direction is \emph{stochastic Lanczos quadrature} (SLQ):
-estimate $\log|K|$ as $m\cdot\E_{\mathbf{u}}[\log\tilde\mu(\mathbf{u})]$,
-where $\tilde\mu$ is a stochastic Gauss quadrature approximation to the
-spectral measure of $K$, requiring only matrix--vector products with $K$
-(which remain $O(m)$).  The gradient \eqref{eq:grad-logdet-aniso} can be
-obtained by differentiating the Gauss nodes and weights with respect to $H$.
-This approach is left for future work.
-\end{remark}
-
-% ============================================================
-\section{MCMC Sampling with NUTS}
-% ============================================================
-
-\subsection{BlackJAX and Window Adaptation}
-
-We use the No-U-Turn Sampler \citep{hoffman2014nuts} as implemented in
-BlackJAX \citep{blackjax2024}, a JAX-native library for Bayesian computation.
-JAX's \texttt{jit}-compilation and automatic differentiation compute the
-gradient of \eqref{eq:log-posterior} efficiently.
-
-The step size and a diagonal mass matrix are tuned during a warm-up phase using
-dual-averaging window adaptation.  After warm-up, samples are drawn and thinned
-via a nested \texttt{jax.lax.scan} for memory efficiency.
-
-\subsection{Initialisation}
-
-The sampler is initialised at
-\begin{equation}
-  \mu^{(0)} = \log\!\left(\frac{n}{\sum_j \tilde{c}_j}\right),
-  \quad \bx^{(0)} = \mathbf{0},
-  \quad \log\kappa^{(0)} = \mu_\kappa,
-  \quad \log\sigma^{(0)} = \mu_\sigma.
-  \label{eq:init}
-\end{equation}
-The initialisation $\mu^{(0)}$ ensures the expected total count under the
-prior equals $n$, consistent with Proposition~\ref{sec:gamma-posterior}.
-
-\subsection{Posterior Prediction}
-
-Given posterior samples $\{(\mu^{(s)}, \bx^{(s)})\}_{s=1}^S$, the intensity
-at any evaluation point $s^* \in \mathcal{D}$ is obtained by barycentric
-interpolation:
-\begin{equation}
-  \hat\lambda^{(s)}(s^*) = \exp\!\left(\mu^{(s)} + \sum_{j=0}^d b_j(s^*) x^{(s)}_{v_j(s^*)}\right),
-\end{equation}
-where $(v_0, \ldots, v_d)$ are the vertices of the containing simplex and
-$(b_0, \ldots, b_d)$ are the barycentric coordinates of $s^*$.
-Points outside the mesh return \texttt{NaN}.
-
-% ============================================================
-\section{Adaptive Triangulation via Reversible-Jump MCMC}
-\label{sec:rjmcmc}
-% ============================================================
-
-\subsection{Refinement Tree}
-
-We augment the static triangulation with a \emph{ternary refinement tree}.
-Every triangle in the initial mesh is a root.  A \emph{birth move} splits a
-leaf triangle $\tau^*$ at its barycenter $s^*$, replacing $\tau^*$ by the
-three child triangles $(s^*,v_0,v_1)$, $(s^*,v_1,v_2)$, $(s^*,v_0,v_2)$.
-A \emph{death move} is the exact reverse: if all three children of an
-interior node $s^*$ are currently leaves, they are merged back into their
-parent $\tau^*$ and $s^*$ is removed.  Birth and death are exact inverses,
-so detailed balance is achievable.
-
-Let $N_m$ be the number of leaf (birth-eligible) triangles and $M_m$ the
-number of removable (death-eligible) nodes in mesh $m$.  After a birth on
-$\tau^*$:
-\begin{equation}
-  N_{m'} = N_m + 2, \qquad
-  M_{m'} = M_m + 1
-           - \mathbf{1}\bigl[\text{all-leaf children test fails for parent}(s^*)\bigr],
-  \label{eq:NM-update}
-\end{equation}
-where parent$(s^*)$ is the node whose earlier birth created $\tau^*$
-(undefined for root triangles, so the indicator is 0 there).
-
-\subsection{Conditional Prior Proposal}
-\label{sec:rj-proposal}
-
-After the 3-split the extended mesh $m'$ has $n_m+1$ nodes.  The SPDE prior
-on the augmented field $(\mathbf{x}_m,x^*)$ is
-$\mathcal{N}(0,\sigma^2 Q'^{-1})$ with $Q'=K'(\tilde{C}')^{-1}K'$.
-Partitioning $Q'$ into the old nodes $(-*)$ and the new node $(*)$:
-\begin{equation}
-  Q' = \begin{pmatrix} Q'_{-*} & (Q'_{*-})^T \\ Q'_{*-} & Q'_{**} \end{pmatrix},
-\end{equation}
-the conditional prior of $x^*$ given the existing field is the
-one-dimensional Gaussian
-\begin{equation}
-  x^*\mid\mathbf{x}_m,m',\kappa,\sigma
-  \;\sim\; \mathcal{N}\!\left(\bar{x}^*,\;\frac{\sigma^2}{Q'_{**}}\right),
-  \qquad
-  \bar{x}^* = -\frac{Q'_{*-}\,\mathbf{x}_m}{Q'_{**}}.
-  \label{eq:cond-prior-rj}
-\end{equation}
-Since $s^*$ connects only to $\{v_0,v_1,v_2\}$ in the mesh graph,
-$K'_{*j}=0$ for $j\notin\{*,v_0,v_1,v_2\}$, and therefore
-$Q'_{*j} = \sum_{k\in\{*,v_0,v_1,v_2\}} K'_{*k}(\tilde{c}'_k)^{-1}K'_{kj}$.
-Both $Q'_{**}$ and $Q'_{*-}$ depend on $O(1)$ FEM values assembled from the
-three new triangles; their evaluation is an $O(1)$ local computation.
-
-\subsection{RJMCMC Acceptance Ratio}
-\label{sec:rj-acceptance}
-
-We propose $x^*$ from the conditional prior $q_*(x^*)=p(x^*\mid\mathbf{x}_m,m',\kappa,\sigma)$.
-The standard \citet{green1995} acceptance ratio for the birth move is
-\begin{equation}
-  \alpha_\mathrm{b} = \min\!\left(1,\;
-    \frac{\pi(m',\,\mathbf{x}_{m'})}
-         {\pi(m,\,\mathbf{x}_m)}\cdot
-    \frac{q_d\,N_m}{q_b\,M_{m'}\,q_*(x^*)}
-  \right),
-  \label{eq:rj-raw}
-\end{equation}
-where $q_b,q_d$ are the probabilities of attempting a birth or death move and
-$\pi(m,\mathbf{x}_m)\propto p(m)\,p(\mathbf{x}_m\mid m,\kappa,\sigma)\,L(m,\mathbf{x}_m,\mu)$
-is the unnormalised posterior.  (The Jacobian of the $u\to x^*$ transformation
-cancels exactly against the proposal density by the change-of-variables
-identity $q_*(x^*)\,|dx^*/du|^{-1}=\phi(u)$.)
-
-\paragraph{Simplification via conditional prior proposal.}
-Substituting $q_*(x^*)=p(\mathbf{x}_m,x^*\mid m')/p(\mathbf{x}_m\mid m')$
-and cancelling common factors:
-\begin{equation}
-  \frac{p(\mathbf{x}_m,x^*\mid m')}
-       {q_*(x^*)\,p(\mathbf{x}_m\mid m)}
-  = \frac{p(\mathbf{x}_m\mid m')}{p(\mathbf{x}_m\mid m)}
-  \;\eqqcolon\; \mathcal{R}_\mathrm{prior},
-\end{equation}
-so the acceptance ratio reduces to
-\begin{equation}
-  \alpha_\mathrm{b} = \min\!\left(1,\;
-    \mathcal{R}_\mathrm{prior}
-    \cdot
-    \underbrace{\frac{L(m',\mathbf{x}_{m'},\mu)}
-                     {L(m,\mathbf{x}_m,\mu)}}_{\mathcal{R}_L}
-    \cdot
-    \underbrace{\frac{p(m')}{p(m)}}_{\mathcal{R}_m}
-    \cdot\frac{q_d\,N_m}{q_b\,M_{m'}}
-  \right).
-  \label{eq:rj-acc}
-\end{equation}
-The death move acceptance ratio is $\min(1,\alpha_\mathrm{b}^{-1})$.
-
-\subsection{Prior Consistency and the Approximation $\mathcal{R}_\mathrm{prior}\approx 1$}
-\label{sec:rj-prior}
-
-The term $\mathcal{R}_\mathrm{prior} = p(\mathbf{x}_m\mid m')/p(\mathbf{x}_m\mid m)$
-compares the SPDE prior on the \emph{old} nodes under the two meshes.
-For a true Mat\'ern Gaussian process, this ratio equals 1 exactly: the GP
-consistency property guarantees that the marginal at any fixed set of
-locations is determined solely by the covariance function, independent of
-which additional locations are included in the model.
-
-For the \emph{FEM-discretised} prior, however, $\mathcal{R}_\mathrm{prior}\neq 1$
-in general.  Splitting $\tau^*$ modifies the piecewise-linear basis functions
-at $v_0,v_1,v_2$: the stiffness and mass integrals over the former $\tau^*$
-are replaced by integrals over three smaller triangles, so $Q'_{-*}\neq Q$ and
-the Schur complement $Q'_\mathrm{SC} \neq Q$.  The discrepancy is
-\begin{equation}
-  Q'_\mathrm{SC} - Q \;=\;
-  \underbrace{(Q'_{-*} - Q)}_{\text{FEM change at }v_0,v_1,v_2}
-  - \frac{(Q'_{*-})^T Q'_{*-}}{Q'_{**}},
-  \label{eq:SC-diff}
-\end{equation}
-which has nonzeros only in rows/columns $\{v_0,v_1,v_2\}$ and their
-2-hop neighbours.  Both terms scale with the area $|\tau^*|$ of the split
-triangle, so $\|Q'_\mathrm{SC}-Q\|=O(|\tau^*|)$ and
-$\log\mathcal{R}_\mathrm{prior}=O(|\tau^*|^2)$.  Finer triangles produce
-smaller corrections, and the correction vanishes in the mesh-refinement limit
-as the FEM prior converges to the true Matérn GP.
-
-We therefore adopt the approximation
-\begin{equation}
-  \mathcal{R}_\mathrm{prior} \approx 1,
-  \label{eq:Rprior-approx}
-\end{equation}
-which is exact for the true GP prior and is a consistent approximation for
-the FEM prior.  The acceptance ratio simplifies to
-\begin{equation}
-  \boxed{
-  \alpha_\mathrm{b} = \min\!\left(1,\;
-    \underbrace{\frac{L(m',\mathbf{x}_{m'},\mu)}
-                     {L(m,\mathbf{x}_m,\mu)}}_{\mathcal{R}_L}
-    \cdot
-    \underbrace{\frac{p(m')}{p(m)}}_{\mathcal{R}_m}
-    \cdot\frac{q_d\,N_m}{q_b\,M_{m'}}
-  \right).}
-  \label{eq:rj-acc-simple}
-\end{equation}
-
-\begin{remark}[Exact cancellation via GP prior]
-$\mathcal{R}_\mathrm{prior}=1$ holds \emph{exactly} if the prior on every mesh
-is defined by the Mat\'ern covariance function directly---i.e.\
-$p(\mathbf{x}_m\mid m,\kappa,\sigma)=\mathcal{N}(0,\Sigma_m)$ with
-$\Sigma_{ij}=\sigma^2 C_\nu(s_i,s_j;\kappa)$---rather than by the FEM
-precision.  In that case the proposal \eqref{eq:cond-prior-rj} becomes the
-kriging predictor under the Mat\'ern covariance, replacing the local FEM
-formula with a dense covariance solve.  The FEM approximation is then used
-only for the likelihood (lumped-mass quadrature and barycentric interpolation),
-not for the prior.
-\end{remark}
-
-\subsection{Likelihood Ratio}
-\label{sec:rj-ll}
-
-Because only the triangles touching $\tau^*$ change, the log-likelihood ratio
-is local:
-\begin{equation}
-  \log\mathcal{R}_L
-  = \!\sum_{i:\,s_i\in\tau^*}\!\!\!\log\frac{\hat\lambda'(s_i)}{\hat\lambda(s_i)}
-  - \left[\tilde{c}'_{s^*}e^{\mu+x^*}
-    + \sum_{j\in\{v_0,v_1,v_2\}}\!(\tilde{c}'_{v_j}-\tilde{c}_{v_j})\,e^{\mu+x_{v_j}}\right].
-  \label{eq:rj-ll}
-\end{equation}
-The first sum covers only the $O(n/N_m)$ observations falling inside $\tau^*$,
-using barycentric weights recomputed in the new child triangles.
-
-\subsection{Mesh Prior}
-\label{sec:mesh-prior}
-
-A natural choice is a geometric prior on the number of leaf triangles:
-\begin{equation}
-  p(m) \propto \rho^{N_m-N_0}, \qquad 0<\rho<1,
-  \label{eq:mesh-prior}
-\end{equation}
-where $N_0$ is the initial triangle count and $\rho$ controls the expected
-depth of refinement.  Under \eqref{eq:mesh-prior}, $\mathcal{R}_m=\rho^2$
-for every birth move (two new leaves added).
-
-% ============================================================
 \section{Adaptive Hierarchical Basis on $[0,1]^D$}
 \label{sec:hat-tree}
 % ============================================================
 
-We replace the Delaunay triangulation of Section~\ref{sec:adaptive-tri} with a
+This is the primary discretisation used throughout this note.  Rather than
+meshing the domain with simplices (the Level-1 baseline of
+Section~\ref{sec:baseline}, which does not scale to $D\ge 3$; see
+Appendix~\ref{sec:lessons}), we represent the field directly in a
 hierarchical tree of basis functions adapted to the observed point pattern.
 Unlike the leaf-only approach of a rectangular partition, the active basis
 includes nodes at \emph{every level} of the tree — the root, its children, and
@@ -1127,6 +492,415 @@ coordinates, and at most one hat per dimension is nonzero at $s_i$.
 The Poisson integral is approximated by a fixed quadrature rule.
 
 % ============================================================
+\section{Likelihood Discretisation}
+% ============================================================
+
+\subsection{Observation Matrix}
+
+In general the log-intensity at an observation is $\log\lambda(s_i) = \mu +
+\bphi(s_i)^T\bx$, where $\bphi(s_i)_j = \phi_j(s_i)$ evaluates every active basis
+function at $s_i$.  For the adaptive tree basis this is the tensor-product form
+\eqref{eq:hat-loglik-new}; for the triangulation baseline the row reduces to the
+barycentric coordinates of the containing simplex, as follows.
+
+For observation $s_i$ lying in simplex $\tau(i)$ with vertices
+$v_0^{(i)}, \ldots, v_d^{(i)}$, let $\lambda_i = (\lambda_{v_0^{(i)}}, \ldots,
+\lambda_{v_d^{(i)}})$ be the nodal values.  By piecewise linear interpolation,
+\begin{equation}
+  \log\hat\lambda(s_i) = \mu + \sum_{j=0}^{d} b_{ij} \, x_{v_j^{(i)}},
+\end{equation}
+where $b_{ij} \ge 0$ are the barycentric coordinates of $s_i$ in $\tau(i)$.
+
+The sum term in \eqref{eq:poisson-ll} becomes $\sum_i x_{v_j^{(i)}} b_{ij} = A\bx$
+where $A \in \R^{n \times m}$ is the sparse barycentric projection matrix.
+Because the $i$-th row of $A$ is the barycentric coordinates of $s_i$, and
+since barycentric coordinates sum to one, the log-likelihood can be written as
+\begin{equation}
+  \sum_{i=1}^n \log\lambda(s_i) = n\mu + \mathbf{d}^T \bx,
+  \label{eq:data-term}
+\end{equation}
+where the \emph{data-accumulation vector} $\mathbf{d} \in \R^m$ is
+$d_j = \sum_{i : v_j \in \tau(i)} b_{ij}$, assembled by scattering barycentric
+weights to their respective nodes.
+
+\subsection{Integral Approximation and Lumped Mass Quadrature}
+\label{sec:integral-approx}
+
+The integral $\int_\mathcal{D} \lambda(s) \dd s$ is approximated by a
+nodal quadrature rule.  Expanding $\lambda(s) = \exp(\mu + x(s))$ and
+integrating the piecewise linear interpolant gives
+\begin{equation}
+  \int_\mathcal{D} \exp\!\bigl(\mu + x(s)\bigr) \dd s
+  \approx \sum_{j=1}^m c_j \exp(\mu + x_j),
+  \qquad c_j = \int_\mathcal{D} \phi_j(s) \dd s = \tilde{C}_{jj}.
+  \label{eq:integral-approx}
+\end{equation}
+The lumped weights $c_j = \tilde{C}_{jj} = (C\mathbf{1})_j$ equal the area
+contributed to node $j$ across all incident simplices, specifically
+$c_j = \sum_{\tau \ni j} |\tau|/(d+1)$.
+
+\subsection{Domain Correction for Buffer Nodes}
+\label{sec:obs-bounds}
+
+When the mesh bounding box $\hat{\mathcal{D}}$ is larger than the observation
+domain $\mathcal{D}_{\rm obs}$, the buffer nodes $j \notin \mathcal{D}_{\rm obs}$
+have $c_j > 0$ but lie outside the region over which the Poisson likelihood is
+defined.  Including them inflates the integral, biasing $\mu$ downward.
+
+The fix is to zero the lumped weights for buffer nodes before forming the integral:
+\begin{equation}
+  \tilde{c}_j = c_j \cdot \mathbf{1}[s_j \in \mathcal{D}_{\rm obs}].
+  \label{eq:obs-bounds}
+\end{equation}
+With this correction, the likelihood integral is $\sum_j \tilde{c}_j \exp(\mu+x_j)$,
+which integrates only over the observation domain.
+
+\subsection{Posterior Normalization Property}
+\label{sec:gamma-posterior}
+
+\begin{proposition}
+Under a flat prior $p(\mu) \propto 1$ and the LGCP likelihood \eqref{eq:poisson-ll}
+with the quadrature \eqref{eq:integral-approx}, the conditional posterior of the
+expected total count $N = \sum_j \tilde{c}_j \exp(\mu + x_j)$, given $\bx$, is
+$\mathrm{Gamma}(n, 1)$ with mean $n$.
+\end{proposition}
+
+\begin{proof}
+Let $Z(\bx) = \sum_j \tilde{c}_j e^{x_j}$.  The log-posterior in $\mu$,
+$p(\mu \mid \bx, \{s_i\}) \propto \exp(n\mu - Z(\bx) e^\mu)$,
+is the kernel of a $\mathrm{Gamma}(n, 1/Z(\bx))$ distribution on
+$N = Z(\bx)e^\mu$.  Hence $\E[N \mid \bx] = n$ for any realization of
+$\bx$.
+\end{proof}
+
+This property provides a useful diagnostic: after sampling, the posterior mean
+of $\sum_j \tilde{c}_j \exp(\hat\mu + \hat x_j)$ should equal $n$.  Without
+the domain correction~\eqref{eq:obs-bounds}, the guarantee holds for the full
+mesh domain $\hat{\mathcal{D}}$ rather than $\mathcal{D}_{\rm obs}$.
+
+% ============================================================
+\section{Joint Inference for Hyperparameters}
+\label{sec:hyperparams}
+% ============================================================
+
+\subsection{Parameterisation and Prior}
+
+We infer $(\mu, \kappa, \sigma, \bx)$ jointly.  The model is
+\begin{align}
+  \log\kappa &\sim \mathcal{N}(\mu_\kappa, \sigma_\kappa^2), \\
+  \log\sigma  &\sim \mathcal{N}(\mu_\sigma, \sigma_\sigma^2), \\
+  \bx \mid \kappa, \sigma &\sim \mathcal{N}(0,\; \sigma^2 Q(\kappa)^{-1}), \\
+  \{s_i\} \mid \mu, \bx &\sim \text{LGCP with } \log\lambda = \mu + \bx.
+  \label{eq:model}
+\end{align}
+
+\subsection{Centred Parameterisation to Avoid Neal's Funnel}
+\label{sec:centred}
+
+A non-centred parameterisation $\bx = \sigma \tilde\bx$ with
+$\tilde\bx \sim \mathcal{N}(0, Q^{-1})$ creates a \emph{Neal's funnel}
+\citep{neal2003slice}: the joint distribution
+$({\sigma, \tilde\bx})$ and $(2\sigma, \tilde\bx/2)$ produce nearly identical
+likelihood values, yet the prior on $\tilde\bx$ \emph{improves} as
+$\tilde\bx \to 0$, giving the sampler a free gradient towards $\sigma \to \infty$
+with $\tilde\bx \to 0$.  Traces of $\log\sigma$ diverge.
+
+The \emph{centred parameterisation} resolves this by working directly with
+$\bx$ in \eqref{eq:model}.  The prior log-density is
+\begin{equation}
+  \log p(\bx \mid \kappa, \sigma) =
+    -\frac{1}{2\sigma^2} \bx^T Q \bx
+    + \tfrac{1}{2}\log|Q|
+    - m \log\sigma
+    + \text{const},
+  \label{eq:log-prior-x}
+\end{equation}
+where the $-m\log\sigma$ term (the Jacobian for the change-of-variables
+$\bx \to \tilde\bx = \bx/\sigma$) strongly penalises large $\sigma$.
+For $m \approx 130$ nodes, increasing $\sigma$ by a factor of 10 costs
+$130 \log 10 \approx 299$ log-units in prior density.
+
+\subsection{Log-Determinant via Generalised Eigenvalues}
+\label{sec:logdet}
+
+The log-prior \eqref{eq:log-prior-x} requires $\log|Q(\kappa)| = 2\log|K(\kappa)| - \log|\tilde{C}|$.
+Recomputing $\log|K|$ at every MCMC step via Cholesky costs $O(m^3)$ per
+iteration.  We reduce this to $O(m)$ via the spectral decomposition.
+
+\begin{proposition}[Eigenvalue log-det trick]
+Let $G v_i = \mu_i C v_i$ be the generalised eigenproblem (computed once,
+$O(m^3)$).  Then for any scalar $\kappa$,
+\begin{equation}
+  \log|K(\kappa)| = \log|C| + \sum_{i=1}^m \log(\kappa^2 + \mu_i).
+  \label{eq:logdet-trick}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Factorise $K = \kappa^2 C + G = C(\kappa^2 I + C^{-1}G)$.  Then
+$\log|K| = \log|C| + \log|\kappa^2 I + C^{-1}G|$.
+The matrix $C^{-1}G$ has eigenvalues $\mu_i$, so
+$\log|\kappa^2 I + C^{-1}G| = \sum_i \log(\kappa^2 + \mu_i)$.
+\end{proof}
+
+The eigenpairs $\{(\mu_i, v_i)\}$ are computed once before sampling via
+\texttt{scipy.linalg.eigh}; within BlackJAX, \eqref{eq:logdet-trick} reduces
+the log-determinant evaluation to a single sum over eigenvalues.
+
+\begin{remark}
+This trick requires scalar $\kappa$.  For non-stationary fields where
+$\kappa(s)$ varies, the pencil $K(\kappa) = \diag(\kappa^2)C + G$ is no longer
+a polynomial in a single scalar, and stochastic Lanczos quadrature (SLQ) would
+be needed instead.
+\end{remark}
+
+\subsection{Full Log-Posterior}
+
+Combining all terms, the log-posterior to be sampled is
+\begin{align}
+  \log p(\mu, \log\kappa, \log\sigma, \bx \mid \{s_i\})
+  &= \underbrace{n\mu + \mathbf{d}^T \bx - \sum_j \tilde{c}_j e^{\mu+x_j}}_{\text{Poisson likelihood}} \notag \\
+  &\quad - \underbrace{\frac{1}{2\sigma^2}\bx^T Q \bx + \frac{1}{2}\log|Q| - m\log\sigma}_{\text{SPDE prior on } \bx}
+  \label{eq:log-posterior} \\
+  &\quad - \underbrace{\frac{(\log\kappa - \mu_\kappa)^2}{2\sigma_\kappa^2}
+         + \frac{(\log\sigma - \mu_\sigma)^2}{2\sigma_\sigma^2}}_{\text{hyperparameter priors}}. \notag
+\end{align}
+
+% ============================================================
+\section{MCMC Sampling with NUTS}
+% ============================================================
+
+\subsection{BlackJAX and Window Adaptation}
+
+We use the No-U-Turn Sampler \citep{hoffman2014nuts} as implemented in
+BlackJAX \citep{blackjax2024}, a JAX-native library for Bayesian computation.
+JAX's \texttt{jit}-compilation and automatic differentiation compute the
+gradient of \eqref{eq:log-posterior} efficiently.
+
+The step size and a diagonal mass matrix are tuned during a warm-up phase using
+dual-averaging window adaptation.  After warm-up, samples are drawn and thinned
+via a nested \texttt{jax.lax.scan} for memory efficiency.
+
+\subsection{Initialisation}
+
+The sampler is initialised at
+\begin{equation}
+  \mu^{(0)} = \log\!\left(\frac{n}{\sum_j \tilde{c}_j}\right),
+  \quad \bx^{(0)} = \mathbf{0},
+  \quad \log\kappa^{(0)} = \mu_\kappa,
+  \quad \log\sigma^{(0)} = \mu_\sigma.
+  \label{eq:init}
+\end{equation}
+The initialisation $\mu^{(0)}$ ensures the expected total count under the
+prior equals $n$, consistent with Proposition~\ref{sec:gamma-posterior}.
+
+\subsection{Posterior Prediction}
+
+Given posterior samples $\{(\mu^{(s)}, \bx^{(s)})\}_{s=1}^S$, the intensity
+at any evaluation point $s^* \in \mathcal{D}$ is obtained by barycentric
+interpolation:
+\begin{equation}
+  \hat\lambda^{(s)}(s^*) = \exp\!\left(\mu^{(s)} + \sum_{j=0}^d b_j(s^*) x^{(s)}_{v_j(s^*)}\right),
+\end{equation}
+where $(v_0, \ldots, v_d)$ are the vertices of the containing simplex and
+$(b_0, \ldots, b_d)$ are the barycentric coordinates of $s^*$.
+Points outside the mesh return \texttt{NaN}.
+
+% ============================================================
+\section{Adaptive Refinement via Reversible-Jump MCMC}
+\label{sec:rjmcmc}
+% ============================================================
+
+The number of active basis functions is itself unknown, so we sample it with
+reversible-jump MCMC \citep{green1995}.  For the adaptive tree basis of
+Section~\ref{sec:hat-tree} a \emph{birth move} advances one node one step in its
+local hierarchy (const $\to$ linear $\to$ unit hat $\to$ sub-hat), adding one
+coefficient; a \emph{death move} reverses it.  Because sibling hats have zero
+mass and stiffness overlap (Eq.~\eqref{eq:C-block-zero}), each move updates the
+FEM matrices in $O(D)$ work with no global rebuild.  We first present the scheme
+in its original form on the triangulation baseline, where a node corresponds to
+a triangle and a birth performs a ternary simplex split; the acceptance ratio
+below is identical for the tree basis, with the local FEM updates replaced by
+the closed forms of Section~\ref{sec:hat-tree}.
+
+\subsection{Refinement Tree}
+
+We augment the static triangulation with a \emph{ternary refinement tree}.
+Every triangle in the initial mesh is a root.  A \emph{birth move} splits a
+leaf triangle $\tau^*$ at its barycenter $s^*$, replacing $\tau^*$ by the
+three child triangles $(s^*,v_0,v_1)$, $(s^*,v_1,v_2)$, $(s^*,v_0,v_2)$.
+A \emph{death move} is the exact reverse: if all three children of an
+interior node $s^*$ are currently leaves, they are merged back into their
+parent $\tau^*$ and $s^*$ is removed.  Birth and death are exact inverses,
+so detailed balance is achievable.
+
+Let $N_m$ be the number of leaf (birth-eligible) triangles and $M_m$ the
+number of removable (death-eligible) nodes in mesh $m$.  After a birth on
+$\tau^*$:
+\begin{equation}
+  N_{m'} = N_m + 2, \qquad
+  M_{m'} = M_m + 1
+           - \mathbf{1}\bigl[\text{all-leaf children test fails for parent}(s^*)\bigr],
+  \label{eq:NM-update}
+\end{equation}
+where parent$(s^*)$ is the node whose earlier birth created $\tau^*$
+(undefined for root triangles, so the indicator is 0 there).
+
+\subsection{Conditional Prior Proposal}
+\label{sec:rj-proposal}
+
+After the 3-split the extended mesh $m'$ has $n_m+1$ nodes.  The SPDE prior
+on the augmented field $(\mathbf{x}_m,x^*)$ is
+$\mathcal{N}(0,\sigma^2 Q'^{-1})$ with $Q'=K'(\tilde{C}')^{-1}K'$.
+Partitioning $Q'$ into the old nodes $(-*)$ and the new node $(*)$:
+\begin{equation}
+  Q' = \begin{pmatrix} Q'_{-*} & (Q'_{*-})^T \\ Q'_{*-} & Q'_{**} \end{pmatrix},
+\end{equation}
+the conditional prior of $x^*$ given the existing field is the
+one-dimensional Gaussian
+\begin{equation}
+  x^*\mid\mathbf{x}_m,m',\kappa,\sigma
+  \;\sim\; \mathcal{N}\!\left(\bar{x}^*,\;\frac{\sigma^2}{Q'_{**}}\right),
+  \qquad
+  \bar{x}^* = -\frac{Q'_{*-}\,\mathbf{x}_m}{Q'_{**}}.
+  \label{eq:cond-prior-rj}
+\end{equation}
+Since $s^*$ connects only to $\{v_0,v_1,v_2\}$ in the mesh graph,
+$K'_{*j}=0$ for $j\notin\{*,v_0,v_1,v_2\}$, and therefore
+$Q'_{*j} = \sum_{k\in\{*,v_0,v_1,v_2\}} K'_{*k}(\tilde{c}'_k)^{-1}K'_{kj}$.
+Both $Q'_{**}$ and $Q'_{*-}$ depend on $O(1)$ FEM values assembled from the
+three new triangles; their evaluation is an $O(1)$ local computation.
+
+\subsection{RJMCMC Acceptance Ratio}
+\label{sec:rj-acceptance}
+
+We propose $x^*$ from the conditional prior $q_*(x^*)=p(x^*\mid\mathbf{x}_m,m',\kappa,\sigma)$.
+The standard \citet{green1995} acceptance ratio for the birth move is
+\begin{equation}
+  \alpha_\mathrm{b} = \min\!\left(1,\;
+    \frac{\pi(m',\,\mathbf{x}_{m'})}
+         {\pi(m,\,\mathbf{x}_m)}\cdot
+    \frac{q_d\,N_m}{q_b\,M_{m'}\,q_*(x^*)}
+  \right),
+  \label{eq:rj-raw}
+\end{equation}
+where $q_b,q_d$ are the probabilities of attempting a birth or death move and
+$\pi(m,\mathbf{x}_m)\propto p(m)\,p(\mathbf{x}_m\mid m,\kappa,\sigma)\,L(m,\mathbf{x}_m,\mu)$
+is the unnormalised posterior.  (The Jacobian of the $u\to x^*$ transformation
+cancels exactly against the proposal density by the change-of-variables
+identity $q_*(x^*)\,|dx^*/du|^{-1}=\phi(u)$.)
+
+\paragraph{Simplification via conditional prior proposal.}
+Substituting $q_*(x^*)=p(\mathbf{x}_m,x^*\mid m')/p(\mathbf{x}_m\mid m')$
+and cancelling common factors:
+\begin{equation}
+  \frac{p(\mathbf{x}_m,x^*\mid m')}
+       {q_*(x^*)\,p(\mathbf{x}_m\mid m)}
+  = \frac{p(\mathbf{x}_m\mid m')}{p(\mathbf{x}_m\mid m)}
+  \;\eqqcolon\; \mathcal{R}_\mathrm{prior},
+\end{equation}
+so the acceptance ratio reduces to
+\begin{equation}
+  \alpha_\mathrm{b} = \min\!\left(1,\;
+    \mathcal{R}_\mathrm{prior}
+    \cdot
+    \underbrace{\frac{L(m',\mathbf{x}_{m'},\mu)}
+                     {L(m,\mathbf{x}_m,\mu)}}_{\mathcal{R}_L}
+    \cdot
+    \underbrace{\frac{p(m')}{p(m)}}_{\mathcal{R}_m}
+    \cdot\frac{q_d\,N_m}{q_b\,M_{m'}}
+  \right).
+  \label{eq:rj-acc}
+\end{equation}
+The death move acceptance ratio is $\min(1,\alpha_\mathrm{b}^{-1})$.
+
+\subsection{Prior Consistency and the Approximation $\mathcal{R}_\mathrm{prior}\approx 1$}
+\label{sec:rj-prior}
+
+The term $\mathcal{R}_\mathrm{prior} = p(\mathbf{x}_m\mid m')/p(\mathbf{x}_m\mid m)$
+compares the SPDE prior on the \emph{old} nodes under the two meshes.
+For a true Mat\'ern Gaussian process, this ratio equals 1 exactly: the GP
+consistency property guarantees that the marginal at any fixed set of
+locations is determined solely by the covariance function, independent of
+which additional locations are included in the model.
+
+For the \emph{FEM-discretised} prior, however, $\mathcal{R}_\mathrm{prior}\neq 1$
+in general.  Splitting $\tau^*$ modifies the piecewise-linear basis functions
+at $v_0,v_1,v_2$: the stiffness and mass integrals over the former $\tau^*$
+are replaced by integrals over three smaller triangles, so $Q'_{-*}\neq Q$ and
+the Schur complement $Q'_\mathrm{SC} \neq Q$.  The discrepancy is
+\begin{equation}
+  Q'_\mathrm{SC} - Q \;=\;
+  \underbrace{(Q'_{-*} - Q)}_{\text{FEM change at }v_0,v_1,v_2}
+  - \frac{(Q'_{*-})^T Q'_{*-}}{Q'_{**}},
+  \label{eq:SC-diff}
+\end{equation}
+which has nonzeros only in rows/columns $\{v_0,v_1,v_2\}$ and their
+2-hop neighbours.  Both terms scale with the area $|\tau^*|$ of the split
+triangle, so $\|Q'_\mathrm{SC}-Q\|=O(|\tau^*|)$ and
+$\log\mathcal{R}_\mathrm{prior}=O(|\tau^*|^2)$.  Finer triangles produce
+smaller corrections, and the correction vanishes in the mesh-refinement limit
+as the FEM prior converges to the true Matérn GP.
+
+We therefore adopt the approximation
+\begin{equation}
+  \mathcal{R}_\mathrm{prior} \approx 1,
+  \label{eq:Rprior-approx}
+\end{equation}
+which is exact for the true GP prior and is a consistent approximation for
+the FEM prior.  The acceptance ratio simplifies to
+\begin{equation}
+  \boxed{
+  \alpha_\mathrm{b} = \min\!\left(1,\;
+    \underbrace{\frac{L(m',\mathbf{x}_{m'},\mu)}
+                     {L(m,\mathbf{x}_m,\mu)}}_{\mathcal{R}_L}
+    \cdot
+    \underbrace{\frac{p(m')}{p(m)}}_{\mathcal{R}_m}
+    \cdot\frac{q_d\,N_m}{q_b\,M_{m'}}
+  \right).}
+  \label{eq:rj-acc-simple}
+\end{equation}
+
+\begin{remark}[Exact cancellation via GP prior]
+$\mathcal{R}_\mathrm{prior}=1$ holds \emph{exactly} if the prior on every mesh
+is defined by the Mat\'ern covariance function directly---i.e.\
+$p(\mathbf{x}_m\mid m,\kappa,\sigma)=\mathcal{N}(0,\Sigma_m)$ with
+$\Sigma_{ij}=\sigma^2 C_\nu(s_i,s_j;\kappa)$---rather than by the FEM
+precision.  In that case the proposal \eqref{eq:cond-prior-rj} becomes the
+kriging predictor under the Mat\'ern covariance, replacing the local FEM
+formula with a dense covariance solve.  The FEM approximation is then used
+only for the likelihood (lumped-mass quadrature and barycentric interpolation),
+not for the prior.
+\end{remark}
+
+\subsection{Likelihood Ratio}
+\label{sec:rj-ll}
+
+Because only the triangles touching $\tau^*$ change, the log-likelihood ratio
+is local:
+\begin{equation}
+  \log\mathcal{R}_L
+  = \!\sum_{i:\,s_i\in\tau^*}\!\!\!\log\frac{\hat\lambda'(s_i)}{\hat\lambda(s_i)}
+  - \left[\tilde{c}'_{s^*}e^{\mu+x^*}
+    + \sum_{j\in\{v_0,v_1,v_2\}}\!(\tilde{c}'_{v_j}-\tilde{c}_{v_j})\,e^{\mu+x_{v_j}}\right].
+  \label{eq:rj-ll}
+\end{equation}
+The first sum covers only the $O(n/N_m)$ observations falling inside $\tau^*$,
+using barycentric weights recomputed in the new child triangles.
+
+\subsection{Mesh Prior}
+\label{sec:mesh-prior}
+
+A natural choice is a geometric prior on the number of leaf triangles:
+\begin{equation}
+  p(m) \propto \rho^{N_m-N_0}, \qquad 0<\rho<1,
+  \label{eq:mesh-prior}
+\end{equation}
+where $N_0$ is the initial triangle count and $\rho$ controls the expected
+depth of refinement.  Under \eqref{eq:mesh-prior}, $\mathcal{R}_m=\rho^2$
+for every birth move (two new leaves added).
+
+% ============================================================
 \section{Infinite-Dimensional Sampling Methods}
 \label{sec:inf-dim-samplers}
 % ============================================================
@@ -1252,7 +1026,7 @@ is the graph Laplacian of the mesh connectivity, the condition number satisfies
 for a 4-connected grid (eigenvalues of $L_{\rm graph}$ lie in $[0,8]$).  This is
 \emph{independent of $N$}, so CG converges in $O(1)$ iterations and each leapfrog
 step costs $O(N)$.  For the FEM precision matrix derived from the SPDE operator
-(Section~\ref{sec:precision}), the same argument holds with $\kappa^2$
+(Section~\ref{sec:spde-op}), the same argument holds with $\kappa^2$
 replacing 8 as the dominant eigenvalue bound.
 
 \subsection{Combining Hilbert-Space HMC with RJMCMC}
@@ -1340,6 +1114,293 @@ is $p_{\rm trans} \approx 0.1$.
 \end{description}
 
 % ============================================================
+\section{Stationary Anisotropic Extension}
+\label{sec:anisotropic}
+% ============================================================
+
+This extension was developed on the triangulation baseline
+(Section~\ref{sec:baseline}), where per-simplex gradients make the
+diffusion-tensor assembly natural; the same construction carries over to the
+adaptive tree basis through its diagonal stiffness matrix.  We keep the simplex
+presentation here because that is where it was first worked out.
+
+\subsection{Anisotropy Matrix Parameterisation}
+
+The isotropic model (Section~\ref{sec:hyperparams}) treats all directions
+equally through a scalar range parameter $\kappa$.  A stationary
+\emph{anisotropic} generalisation retains a constant diffusion tensor $H$ in
+\eqref{eq:spde-gen}.  In $\R^2$ we parameterise
+\begin{equation}
+  H = R(\theta)\,\diag(\kappa_x^2,\,\kappa_y^2)\,R(\theta)^T,
+  \label{eq:H-param}
+\end{equation}
+where $R(\theta)$ is the $2\times 2$ rotation matrix and $\kappa_x, \kappa_y > 0$
+are effective range parameters along the principal axes of the field.
+The elements of $H$ are
+\begin{align}
+  h_{11} &= \kappa_x^2\cos^2\!\theta + \kappa_y^2\sin^2\!\theta, \nonumber\\
+  h_{12} &= (\kappa_x^2 - \kappa_y^2)\cos\theta\sin\theta,           \label{eq:H-components} \\
+  h_{22} &= \kappa_x^2\sin^2\!\theta + \kappa_y^2\cos^2\!\theta.    \nonumber
+\end{align}
+The three parameters $(\log\kappa_x,\, \log\kappa_y,\, \theta)$ replace the
+single scalar $\log\kappa$ from the isotropic model; the marginal variance
+$\sigma$ remains a scalar.  The isotropic case is recovered by setting
+$\kappa_x = \kappa_y$ (any $\theta$), yielding $H = \kappa_x^2 I$.
+
+\subsection{FEM Basis Decomposition}
+\label{sec:aniso-fem}
+
+The anisotropic stiffness matrix
+\[
+G_{H,ij} = \int_\mathcal{D} \nabla\phi_i^T H\,\nabla\phi_j\,\dd s
+\]
+decomposes linearly over three basis matrices:
+\begin{equation}
+  G_H = h_{11}\,G_{xx} + h_{12}\,G_{xy} + h_{22}\,G_{yy},
+  \label{eq:GH-decomp}
+\end{equation}
+with
+\begin{align}
+  G_{xx,ij} &= \sum_\tau |\tau|\,
+    \partial_x\phi_i^{(\tau)}\,\partial_x\phi_j^{(\tau)}, \\
+  G_{yy,ij} &= \sum_\tau |\tau|\,
+    \partial_y\phi_i^{(\tau)}\,\partial_y\phi_j^{(\tau)}, \\
+  G_{xy,ij} &= \sum_\tau |\tau|\!\left(
+    \partial_x\phi_i^{(\tau)}\,\partial_y\phi_j^{(\tau)}
+    + \partial_y\phi_i^{(\tau)}\,\partial_x\phi_j^{(\tau)}\right).
+\end{align}
+All three matrices are assembled once from the fixed mesh prior to sampling and
+stored in COO sparse format.  The isotropic $G = G_{xx} + G_{yy}$ is the
+special case $H = I$.
+
+At each NUTS step, forming $G_H$ costs three sparse scalar-matrix additions, and
+the SPDE operator
+\begin{equation}
+  K(H) = C + G_H(H)
+  \label{eq:K-aniso}
+\end{equation}
+has the same sparsity pattern as the isotropic $K(\kappa)$.  Matrix--vector
+products $K(H)\bx$ therefore cost $O(\mathrm{nnz}) \approx O(m)$ via COO
+scatter-add, unchanged from the isotropic case.
+
+\subsection{Log-Determinant Challenge}
+\label{sec:logdet-aniso}
+
+Section~\ref{sec:logdet} showed that for the isotropic operator $K(\kappa) =
+\kappa^2 C + G$, the log-determinant reduces to $O(m)$ work per step once the
+generalised eigenpairs $G v_i = \mu_i C v_i$ have been precomputed:
+\[
+  \log|K(\kappa)| = \log|C| + \textstyle\sum_i \log(\kappa^2 + \mu_i).
+\]
+This is possible because $K$ is a \emph{scalar-affine} function of the single
+parameter $\kappa^2$: the eigenvectors $\{v_i\}$ are fixed and only the
+eigenvalues shift.
+
+For the anisotropic operator \eqref{eq:K-aniso}, the matrix
+$K(H) = C + h_{11}G_{xx} + h_{12}G_{xy} + h_{22}G_{yy}$
+is a linear combination of four sparse matrices whose coefficients
+$(h_{11}, h_{12}, h_{22})$ all change at every NUTS step.  No fixed eigenbasis
+can diagonalise $K(H)$ for all $H$ simultaneously: a generalised eigenproblem
+$K(H) v = \mu C v$ would need to be resolved whenever $(h_{11}, h_{12}, h_{22})$
+changes.
+
+Consequently, evaluating $\log|K(H)|$ requires a dense factorisation at each
+leapfrog step,
+\begin{equation}
+  \log|K(H)| = \texttt{slogdet}\bigl(K(H)\bigr),
+  \quad\text{cost } O(m^3) \text{ per step.}
+  \label{eq:slogdet-aniso}
+\end{equation}
+The gradient required by NUTS,
+\begin{equation}
+  \frac{\partial\log|K|}{\partial\theta_k}
+  = \tr\!\left(K^{-1}\frac{\partial K}{\partial\theta_k}\right),
+  \label{eq:grad-logdet-aniso}
+\end{equation}
+requires an implicit $K^{-1}$ solve for each of the three anisotropy
+parameters $(\log\kappa_x, \log\kappa_y, \theta)$, which JAX's automatic
+differentiation of \texttt{jnp.linalg.slogdet} provides via the implicit
+function theorem, again at $O(m^3)$ cost.
+
+For meshes of size $m \lesssim 500$ the per-step $O(m^3)$ cost is acceptable
+($\approx\!1$\,ms on a modern CPU), but it precludes scaling to
+$m \gtrsim 2000$.  Finding an efficient $O(m)$--$O(m\log m)$ approximation
+to $\log|K(H)|$ for parametric matrix pencils is an \textbf{open problem}.
+
+\begin{remark}[Stochastic Lanczos quadrature]
+One promising direction is \emph{stochastic Lanczos quadrature} (SLQ):
+estimate $\log|K|$ as $m\cdot\E_{\mathbf{u}}[\log\tilde\mu(\mathbf{u})]$,
+where $\tilde\mu$ is a stochastic Gauss quadrature approximation to the
+spectral measure of $K$, requiring only matrix--vector products with $K$
+(which remain $O(m)$).  The gradient \eqref{eq:grad-logdet-aniso} can be
+obtained by differentiating the Gauss nodes and weights with respect to $H$.
+This approach is left for future work.
+\end{remark}
+
+% ============================================================
+\section{Baseline (Level 1): Adaptive Triangulation FEM}
+\label{sec:baseline}
+\label{sec:adaptive-tri}
+% ============================================================
+
+This section documents the original Level-1 pipeline: an adaptive kd-tree mesh,
+a Delaunay triangulation of its nodes, and piecewise-linear hat functions on the
+resulting simplices.  It predates the adaptive tree hat basis of
+Section~\ref{sec:hat-tree} and has since been superseded by it, for the reasons
+recorded in Appendix~\ref{sec:lessons}: the simplex count grows
+super-exponentially with dimension and the triangulation is not static under
+refinement.  We retain the construction here because it is the concrete instance
+behind the general FEM framework of Section~\ref{sec:galerkin}, and because the
+likelihood, hyperparameter, anisotropic, and RJMCMC machinery were all first
+developed on it.
+
+\subsection{Recursive Equal-Count kd-Tree}
+
+We build a mesh that is automatically denser where the observed point pattern is
+dense.  Starting from a root cell covering the domain, we recursively split
+each cell along its longest axis at the data median until every leaf cell
+contains at most $n_{\max}$ points (the refinement threshold).  This is a
+\emph{balanced} kd-tree partition: each split divides the data approximately
+evenly, so the resulting leaf sizes are $O(n/n_{\rm leaves})$.
+
+The split value is clamped away from the cell boundary by a relative tolerance
+$\epsilon = 10^{-8}$ of the cell width, ensuring no degenerate child cell.
+
+\subsection{Mesh Nodes and Delaunay Triangulation}
+
+Each leaf cell contributes one node to the mesh: the centroid of its data
+points if the cell is non-empty, or the geometric cell midpoint otherwise.
+The $2^d$ corners of the bounding box are added as fixed boundary nodes.
+
+The Delaunay triangulation of all nodes defines the mesh $\mathcal{T}$.
+It is rebuilt from scratch after each refinement or coarsening step.
+
+\subsection{Buffer Region}
+
+To ensure the triangulation is regular near the domain boundary, the bounding
+box is taken slightly larger than the observation domain---typically
+$[-0.1, 1.1]^2$ when observations lie in $[0,1]^2$.  This introduces
+\emph{buffer nodes} in the extended region.  We account for them explicitly in
+the likelihood (Section~\ref{sec:obs-bounds}).
+
+\subsection{Basis Functions and Local Geometry}
+
+On the triangulation $\mathcal{T}$ with $m$ nodes and $T$ simplices, we use
+piecewise linear \emph{hat} basis functions $\{\phi_i\}_{i=1}^m$.  The hat
+function $\phi_j$ equals 1 at node $j$, 0 at every other node, and varies
+linearly in between.  Within any single simplex it is a flat tilted plane, so
+its gradient is \emph{constant} on each simplex and can be computed from
+geometry alone.
+
+\paragraph{Reference simplex and the map $B_\tau$.}
+Every computation is carried out on a fixed \emph{reference simplex}
+$\hat\tau$ with vertices at the origin $\hat{v}_0=\mathbf{0}$ and the
+standard basis vectors $\hat{v}_k = e_k$ for $k=1,\ldots,d$.  On this
+template the hat functions are trivially
+\[
+  \hat\phi_0(\hat s) = 1 - \hat s_1 - \cdots - \hat s_d, \qquad
+  \hat\phi_k(\hat s) = \hat s_k \;\;(k\ge 1),
+\]
+with reference gradients $\nabla_{\hat s}\hat\phi_j = \hat{e}_j$, where
+$\hat{e}_0 = -\mathbf{1}$ and $\hat{e}_k$ is the $k$-th standard basis
+vector.
+
+The matrix
+\begin{equation}
+  B_\tau = [v_1 - v_0, \;\ldots\;, v_d - v_0] \in \R^{d\times d}
+\end{equation}
+maps the reference simplex to the physical simplex $\tau$ via
+$s = v_0 + B_\tau\hat s$.  Its columns are the edge vectors of $\tau$
+emanating from $v_0$, so $B_\tau$ encodes the shape and orientation of the
+triangle.  The volume follows immediately: $|\tau| = |\det B_\tau|/d!$.
+
+\paragraph{Why $B_\tau^{-\top}$ for gradients.}
+The gradient $\nabla_s\phi_j^{(\tau)}$ is the vector $g$ satisfying
+$g\cdot\delta s = \delta\phi$ for every physical displacement $\delta s$.
+Writing $\delta s = B_\tau\,\delta\hat s$ and using the reference gradient
+$\nabla_{\hat s}\hat\phi_j = \hat{e}_j$:
+\[
+  g \cdot B_\tau\,\delta\hat s
+  = \hat{e}_j \cdot \delta\hat s
+  \quad\text{for all }\delta\hat s,
+\]
+which gives $B_\tau^{\top}g = \hat{e}_j$, and therefore
+\begin{equation}
+  \nabla_s \phi_j^{(\tau)} = B_\tau^{-\top}\hat{e}_j, \quad j = 0, \ldots, d.
+  \label{eq:grad-phi}
+\end{equation}
+Intuitively, $B_\tau^{-1}$ converts a physical direction into reference
+coordinates, and the transpose accounts for the fact that gradients scale
+inversely with distances (a squeezed triangle has steeper slopes).  Because
+$B_\tau$ is constant on $\tau$, so is $\nabla_s\phi_j^{(\tau)}$: the hat
+function is a flat ramp, and \eqref{eq:grad-phi} gives its slope.
+
+\subsection{Mass Matrix}
+\label{sec:mass}
+
+The mass matrix $C \in \R^{m\times m}$ has entries
+\begin{equation}
+  C_{ij} = \int_\mathcal{D} \phi_i(s)\phi_j(s) \dd s
+         = \sum_{\tau \ni i,j} |\tau| \frac{1 + \delta_{ij}}{(d+1)(d+2)}.
+  \label{eq:mass}
+\end{equation}
+$C_{ij}$ measures the \emph{overlap} between hat functions $\phi_i$ and
+$\phi_j$: it is nonzero only when nodes $i$ and $j$ share at least one
+simplex.  The diagonal entry $C_{ii}$ is proportional to the total area of
+all simplices containing node $i$.  The matrix is symmetric positive definite
+with sparsity matching the mesh topology.
+
+The \emph{row sum} $\tilde{c}_j = (C\mathbf{1})_j = \sum_k C_{jk}$ is the
+total area ``owned'' by node $j$: it equals $\sum_{\tau\ni j}|\tau|/(d+1)$,
+the average share of each incident simplex.  Geometrically, $\tilde{c}_j$
+approximates the area of the Voronoi cell\footnote{It's not really a Voronoi cell, but it's close-ish to one depending on the triangulation.} around node $j$.  The diagonal
+matrix $\tilde{C} = \diag(C\mathbf{1})$ is the \emph{lumped} mass matrix,
+used in Section~\ref{sec:integral-approx} to approximate the Poisson integral
+as a weighted sum $\sum_j \tilde{c}_j \lambda_j$.
+
+In the SPDE operator $(\kappa^2 - \Delta)$, the term $\kappa^2$ acts like a
+scalar multiple of the identity on functions.  After Galerkin projection onto
+the hat-function basis, this becomes $\kappa^2 C$: the mass matrix is the
+FEM discretisation of the identity operator, weighted by local area.
+
+\subsection{Stiffness Matrix}
+\label{sec:stiffness}
+
+The stiffness matrix $G \in \R^{m\times m}$ has entries
+\begin{equation}
+  G_{ij} = \int_\mathcal{D} \nabla\phi_i(s) \cdot \nabla\phi_j(s) \dd s
+         = \sum_{\tau \ni i,j} |\tau| \, \nabla\phi_i^{(\tau)} \cdot \nabla\phi_j^{(\tau)}.
+  \label{eq:stiff}
+\end{equation}
+$G_{ij}$ measures how much nodes $i$ and $j$ \emph{resist spatial variation}
+together: it is the inner product of the slopes of the two hat functions.
+By integration by parts, $\mathbf{x}^T G\, \mathbf{x} =
+\int|\nabla x(s)|^2\dd s$, so the quadratic form in $G$ is exactly the total
+squared-gradient energy of the piecewise-linear field
+$x(s)=\sum_j x_j\phi_j(s)$.  Smooth fields (small gradients everywhere) have
+low $G$-energy; rough or wiggly fields have high $G$-energy.
+
+Equivalently, $G$ discretises the negative Laplacian $-\Delta$: it can be
+thought of as a network of \emph{springs} connecting adjacent nodes, where
+$G_{ij}$ is (minus) the spring constant for the edge between $i$ and $j$.
+For a Delaunay mesh in 2D, $G_{ij} \le 0$ for all neighbours
+($i\neq j$), and the action $(G\mathbf{x})_i = -\sum_j G_{ij}(x_j - x_i)$
+sums the spring forces pulling node $i$ toward its neighbours' values.
+
+Together, $K = \kappa^2 C + G$ discretises $(\kappa^2 - \Delta)$: the mass
+term $\kappa^2 C$ penalises large \emph{absolute} values of the field, and
+the stiffness term $G$ penalises spatial \emph{roughness}.  Large $\kappa$
+makes the mass term dominate, producing a field with short correlation length
+(rapidly decorrelated); small $\kappa$ lets the stiffness term dominate,
+producing a smoother field correlated over longer distances.
+
+For the generalised case \eqref{eq:spde-gen}, the integrand becomes
+$\nabla\phi_i^T H(\bar\tau) \nabla\phi_j$ where $H$ is evaluated at the
+simplex centroid $\bar\tau$: the anisotropic diffusion tensor $H$ stretches
+the spring network directionally, making correlations longer in some
+directions than others.
+
+% ============================================================
 \section{Implementation Summary}
 % ============================================================
 
@@ -1423,7 +1484,7 @@ need not be rediscovered later.
 \subsection{Delaunay Triangulation Does Not Scale to Higher Dimensions}
 \label{sec:lesson-delaunay}
 
-The Level-1 method (Section~\ref{sec:triangulation}) builds a Delaunay
+The Level-1 method (Section~\ref{sec:baseline}) builds a Delaunay
 triangulation of the domain and assembles FEM matrices over the resulting
 simplices.  Two obstacles make this approach untenable in dimensions $D \ge 3$
 or even in $D=2$ once adaptive resolution is required.
@@ -1454,12 +1515,12 @@ retriangulation, before any matrix assembly.
 Delaunay triangulation is a natural first choice but hits a fundamental
 combinatorial wall in higher dimensions and does not compose well with adaptive
 sampling.  We abandon it in favour of the hat-function tree basis described in
-Section~\ref{sec:adaptive-tri}.
+Section~\ref{sec:hat-tree}.
 
 \subsection{Hat-Function Tree Basis as the Natural Replacement}
 \label{sec:lesson-tree-basis}
 
-The adaptive hierarchical basis (Section~\ref{sec:adaptive-tri}) resolves both
+The adaptive hierarchical basis (Section~\ref{sec:hat-tree}) resolves both
 obstacles above.
 
 \begin{itemize}
