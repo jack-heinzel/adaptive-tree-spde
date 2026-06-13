@@ -1,0 +1,1044 @@
+\documentclass[11pt]{article}
+\input{preamble}
+
+\title{Universal Function Approximators on $[0,1]^D$:\\
+Triangulations and Adaptive Tree Bases for the Mat\'ern SPDE}
+\author{Jack Heinzel}
+\date{Draft --- \today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note develops the finite-element bases used to discretise the Mat\'ern SPDE
+prior of the companion \emph{Foundations} note.  All three are \emph{universal
+function approximators} on $[0,1]^D$, but they differ sharply in how they scale
+with dimension and how they compose with adaptive refinement.  We treat, in turn:
+the \emph{adaptive hat tree basis} (the primary method --- a hierarchical
+tensor-product basis of constant, linear, and dyadic hat functions, with a
+diagonal stiffness matrix and a recursive-block mass matrix that refine locally);
+the \emph{adaptive piecewise-constant tree basis} (a leaf-only indicator basis
+whose mass matrix is diagonal and whose operator must be recast in finite-volume
+/ GMRF form); and the \emph{Delaunay-triangulation baseline} (Level 1, retained
+for context and superseded for the reasons in the lessons appendix).  A common
+theme --- the non-uniqueness of the tree label in $D\ge2$, and its canonical
+fix --- recurs for both tree bases.  We close with the stationary anisotropic
+extension and a lessons-learned appendix.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+% ============================================================
+\section{Adaptive Hierarchical Basis on $[0,1]^D$}
+\label{sec:hat-tree}
+% ============================================================
+
+This is the primary discretisation used throughout this note.  Rather than
+meshing the domain with simplices (the Level-1 baseline of
+Section~\ref{sec:baseline}, which does not scale to $D\ge 3$; see
+Appendix~\ref{sec:lessons}), we represent the field directly in a
+hierarchical tree of basis functions adapted to the observed point pattern.
+Unlike the leaf-only approach of a rectangular partition, the active basis
+includes nodes at \emph{every level} of the tree — the root, its children, and
+all their descendants.  This is essential: if only leaf hat-functions were used,
+the field would be identically zero at every cell boundary, which prevents
+representation of smooth functions.  Including the constant and linear ancestors
+remedies this and yields a basis that spans piecewise-linear functions at all
+dyadic scales.
+
+\subsection{One-Dimensional Hierarchy}
+\label{sec:1d-hierarchy}
+
+Let $\mathcal{D} = [0,1]^D$.  In each dimension $d$ independently, the
+basis functions follow a fixed child rule.
+
+\paragraph{Level 0 --- constant.}
+\begin{equation}
+  f^{(0)}(x) = 1, \quad x \in [0,1].
+  \label{eq:f0}
+\end{equation}
+
+\paragraph{Level 1 --- linear.}
+The unique child of the constant is
+\begin{equation}
+  f^{(1)}(x) = x, \quad x \in [0,1].
+  \label{eq:f1}
+\end{equation}
+
+\paragraph{Level 2 --- unit hat.}
+The unique child of the linear function is the piecewise-linear hat
+\begin{equation}
+  f^{(2)}(x) = \hat(x;\,0,1), \qquad
+  \hat(x;\,lo,hi) =
+  \begin{cases}
+    0                  & x \notin [lo,hi], \\
+    2(x-lo)/(hi-lo)   & x \in [lo,\tfrac{lo+hi}{2}], \\
+    2(hi-x)/(hi-lo)   & x \in [\tfrac{lo+hi}{2},hi].
+  \end{cases}
+  \label{eq:hat1d}
+\end{equation}
+
+\paragraph{Levels $\ge 3$ --- dyadic sub-hats (binary branching).}
+From level~2 onward, each hat $\hat(\cdot;\,lo,hi)$ has two children at
+the midpoint $m = (lo+hi)/2$:
+\begin{equation}
+  \hat(\cdot;\,lo,\,m) \quad \text{(left child)}, \qquad
+  \hat(\cdot;\,m,\,hi) \quad \text{(right child)}.
+  \label{eq:hat-children}
+\end{equation}
+Every interval is dyadic: $[p/2^n,\,(p+1)/2^n]$ for integers $p,n \ge 0$.
+
+\paragraph{Spanning property.}
+The collection $\{1,\, x,\, \hat(\cdot;0,1),\, \hat(\cdot;0,\tfrac12),\,
+\hat(\cdot;\tfrac12,1),\ldots\}$ is the \emph{Schauder basis} for $C([0,1])$:
+every continuous function on $[0,1]$ can be uniformly approximated by finite
+linear combinations.  Including the constant and linear functions is essential;
+without them, the span contains only functions vanishing at 0 and 1.
+
+\subsection{$D$-Dimensional Basis and Active Set}
+\label{sec:Ddim-basis}
+
+A $D$-dimensional basis function is a product of $D$ one-dimensional
+components:
+\begin{equation}
+  \phi_k(x) = \prod_{d=1}^D f_{s_d^{(k)}}(x_d),
+  \label{eq:Ddim-phi}
+\end{equation}
+where $s_d^{(k)}$ is the 1D state of node $k$ in dimension $d$.
+The root has all dimensions at ``const'': $\phi_{\rm root}(x) = 1$.
+A \emph{birth move} advances exactly one dimension one step in its local
+hierarchy (const $\to$ linear $\to$ unit hat $\to$ left or right sub-hat
+$\to \cdots$).
+
+\textbf{The active basis $\{\phi_k\}_{k\in\mathcal{A}}$ consists of all nodes
+in the tree --- root, internal nodes, and leaves alike.}
+Downward closure holds: if node $k$ is active, so is its parent.
+
+\begin{remark}
+If only leaf nodes were used as basis functions, every function in the span
+would be zero on every cell boundary (hat functions vanish at the boundary of
+their support box).  Including the constant and linear ancestors restores full
+approximation power.
+\end{remark}
+
+\subsection{Uniqueness: Product Poset versus Birth Tree}
+\label{sec:uniqueness}
+
+The labelling $\phi_k$ by a \emph{tree node} $k$ obscures a redundancy that
+appears as soon as $D\ge 2$: two distinct nodes of the birth tree can carry the
+\emph{same} basis function.  This subsection makes the redundancy precise,
+identifies its source (birth moves in distinct dimensions commute), and gives a
+canonical labelling that removes it.
+
+\paragraph{The one-dimensional hierarchy as a tree.}
+Collect the 1D states of Section~\ref{sec:1d-hierarchy} into a set $\mathcal{H}$,
+the nodes of the rooted tree generated by the child rule
+\eqref{eq:f0}--\eqref{eq:hat-children}.  Each $\eta\in\mathcal{H}$ carries a
+\emph{level}
+\begin{equation}
+  \ell(\eta) \in \{0,1,2,\dots\},
+\end{equation}
+the number of advance-steps (births) from the root: $\ell=0$ for the constant
+$f^{(0)}$, $\ell=1$ for the linear $f^{(1)}$, $\ell=2$ for the unit hat
+$f^{(2)}=\hat(\cdot;0,1)$, and for $\ell\ge 2$ a dyadic \emph{address}
+\begin{equation}
+  \alpha(\eta)\in\{L,R\}^{\ell-2}
+\end{equation}
+recording the left/right descent \eqref{eq:hat-children} from the unit hat down
+to $\eta$.  The pair $(\ell,\alpha)$ determines $\eta$, hence the 1D function
+$f_\eta$.  The advance (successor) relation is \emph{unary} for $\ell<2$ (const
+$\to$ linear $\to$ unit hat) and \emph{binary} for $\ell\ge2$ (the two dyadic
+children).  Crucially, $\mathcal{H}$ is a tree: the descent from the root to any
+$\eta$ is the \emph{unique} path, a word
+\begin{equation}
+  \rho(\eta)
+  = \bigl(\text{lin},\,\text{hat},\,\alpha_1,\dots,\alpha_{\ell-2}\bigr)
+  \quad\text{of length } \ell(\eta),
+  \label{eq:descent-word}
+\end{equation}
+whose first $\min(\ell,2)$ steps are forced and whose remaining $\ell-2$ steps
+are the address letters.
+
+\paragraph{Basis functions are indexed by a product poset.}
+A $D$-dimensional basis function depends only on the \emph{state vector}
+\begin{equation}
+  s = (s_1,\dots,s_D) \in \mathcal{H}^D,
+  \qquad
+  \phi_s(x) = \prod_{d=1}^D f_{s_d}(x_d),
+  \label{eq:phi-state}
+\end{equation}
+which refines the node-indexed form \eqref{eq:Ddim-phi}: there $s_d=s_d^{(k)}$
+is read off node $k$.  Order $\mathcal{H}^D$ componentwise by the ancestor
+relation of $\mathcal{H}$; the root state is $\mathbf{0}=(0,\dots,0)$ with
+$\phi_{\mathbf 0}\equiv 1$.
+
+\begin{proposition}[Faithful labelling]
+\label{prop:phi-injective}
+The map $s\mapsto\phi_s$ from $\mathcal{H}^D$ to functions on $[0,1]^D$ is
+injective; indeed the family $\{\phi_s\}_{s\in\mathcal{H}^D}$ is linearly
+independent.
+\end{proposition}
+\begin{proof}
+The 1D functions $\{f_\eta\}_{\eta\in\mathcal{H}}$ are linearly independent
+(the Faber--Schauder system: constant, linear, and dyadic hats of strictly
+increasing resolution).  A tensor product of linearly independent families is
+linearly independent, so distinct state vectors give distinct functions.
+\end{proof}
+
+Thus the \emph{state vector $s$ is the canonical, non-redundant label} for a
+basis function.  The active set is honestly a finite, downward-closed subset
+(order ideal) $\mathcal{A}\subset\mathcal{H}^D$: if $s\in\mathcal{A}$ and
+$s'\preceq s$ then $s'\in\mathcal{A}$ (Eq.~\eqref{eq:phi-state} with the
+spanning requirement of Section~\ref{sec:Ddim-basis}).
+
+\paragraph{The birth tree and its projection.}
+The RJMCMC sampler (companion \emph{Sampling Methods} note) does not build
+$\mathcal{A}$ directly; it grows a \emph{birth tree} $\mathcal{T}$ whose nodes
+are sequences
+of birth moves.  A birth move is a pair
+\begin{equation}
+  b = (d,\,c),\qquad d\in\{1,\dots,D\},
+\end{equation}
+that advances coordinate $d$ one step in $\mathcal{H}$; the choice $c$ is vacuous
+when $\ell(s_d)<2$ and is $c\in\{L,R\}$ when $\ell(s_d)\ge2$.  A node of
+$\mathcal{T}$ is a finite birth path $\beta=(b_1,\dots,b_n)$ applied to
+$\mathbf 0$, and
+\begin{equation}
+  \pi:\;\mathcal{T}\longrightarrow\mathcal{H}^D,
+  \qquad
+  \pi(\beta) = b_n\circ\cdots\circ b_1(\mathbf 0),
+\end{equation}
+sends a birth path to the state vector it produces.  The node-indexed basis
+$\phi_k$ is the composite $k\mapsto\pi(k)\mapsto\phi_{\pi(k)}$.
+
+\begin{proposition}[Commutation of cross-dimensional births]
+\label{prop:commute}
+If birth moves $b=(d,c)$ and $b'=(d',c')$ act on distinct coordinates
+$d\ne d'$, then $b'\circ b = b\circ b'$.
+\end{proposition}
+\begin{proof}
+$b$ alters only the $d$-th component of the state vector and $b'$ only the
+$d'$-th; with $d\ne d'$ the two maps act on disjoint coordinates and commute.
+\end{proof}
+
+This is the formal content of ``a child of $X\!-\!Y$ equals a child of
+$Y\!-\!X$'': advancing dimension $X$ then $Y$ reaches the same state vector as
+advancing $Y$ then $X$, hence the same $\phi_s$.  Within a single dimension
+there is no such freedom --- the descent \eqref{eq:descent-word} is unique --- so
+all redundancy is cross-dimensional interleaving.
+
+\begin{proposition}[The fibre of $\pi$ is a set of shuffles]
+\label{prop:fibre}
+Fix $s=(s_1,\dots,s_D)\in\mathcal{H}^D$ with levels $\ell_d=\ell(s_d)$.  The
+birth paths reaching $s$ are exactly the \emph{shuffles} (order-preserving
+interleavings) of the $D$ descent words $\rho(s_1),\dots,\rho(s_D)$ of
+\eqref{eq:descent-word}, each step tagged by its dimension.  Hence
+\begin{equation}
+  \bigl|\pi^{-1}(s)\bigr|
+  = \binom{\ell_1+\cdots+\ell_D}{\ell_1,\;\ell_2,\;\dots,\;\ell_D}
+  = \frac{(\sum_d \ell_d)!}{\prod_d \ell_d!}.
+  \label{eq:fibre-count}
+\end{equation}
+\end{proposition}
+\begin{proof}
+A birth path reaching $s$ must, restricted to coordinate $d$, replay the unique
+descent $\rho(s_d)$ (Proposition~\ref{prop:phi-injective} and the tree structure
+of $\mathcal{H}$); the only freedom is the order in which the $\sum_d\ell_d$
+steps from different coordinates are interleaved, and by
+Proposition~\ref{prop:commute} every interleaving yields the same $s$.  The
+number of interleavings of words of lengths $\ell_1,\dots,\ell_D$ that preserve
+each word's internal order is the multinomial coefficient.
+\end{proof}
+
+\begin{remark}[Magnitude of the redundancy]
+For $D=1$, \eqref{eq:fibre-count} equals $1$: the tree label and the state
+vector coincide, and the basis is automatically unique.  For $D\ge2$ it is
+$>1$ whenever at least two coordinates have advanced: the user's example
+$\ell_X=\ell_Y=1$ gives $\binom{2}{1,1}=2$ (the orders $XY$ and $YX$), and a
+state with all $D$ coordinates at the unit-hat level gives $D!$ distinct birth
+paths for one basis function.  Counting tree nodes therefore badly
+over-counts the basis, and a naive RJMCMC birth proposal visits the same
+$\phi_s$ through many paths.
+\end{remark}
+
+\paragraph{Canonical labelling (the fix).}
+To restore a bijection, impose the fixed total order $1<2<\cdots<D$ on
+dimensions and keep, from each fibre, the \emph{unique sorted shuffle} --- the
+birth path in which dimension indices are non-decreasing (all dimension-$1$
+births, then all dimension-$2$ births, $\dots$).  Equivalently, define the
+\emph{canonical parent} of $s\ne\mathbf 0$ by demoting one step in the
+highest-indexed advanced coordinate,
+\begin{equation}
+  \mathrm{par}(s) = \text{demote } s_{d^\star},
+  \qquad
+  d^\star = \max\{\,d : \ell(s_d)>0\,\}.
+  \label{eq:canon-parent}
+\end{equation}
+Iterating \eqref{eq:canon-parent} drains coordinates from high index to low and
+always reaches $\mathbf 0$, so it defines a spanning tree of the Hasse diagram
+of the order ideal $\mathcal{A}$; on this tree $\pi$ is a bijection onto
+$\mathcal{A}$.
+
+The rule is purely \emph{state-local}, hence usable inside the sampler: a birth
+in dimension $d$ is admissible iff every higher coordinate is still at the root,
+\begin{equation}
+  \text{birth in } d \text{ allowed}
+  \iff
+  \ell(s_{d'}) = 0 \ \text{for all } d'>d.
+  \label{eq:canon-birth-rule}
+\end{equation}
+With \eqref{eq:canon-birth-rule} the RJMCMC birth/death moves (companion
+\emph{Sampling Methods} note) traverse each $\phi_s$ through exactly one path, so
+the move counts $N_m,M_m$ and the acceptance ratio no longer double-count
+interleaved relabellings of the same basis function.
+
+\subsection{One-Dimensional Inner Products}
+\label{sec:1d-inners}
+
+Since $\phi_k$ is a product of 1D functions, all mass and stiffness entries
+factor into products of 1D inner products.  Define
+\begin{align}
+  m(f, g) &= \int_0^1 f(x)\,g(x)\,\dd x, \label{eq:mfg} \\
+  s(f, g) &= \int_0^1 f'(x)\,g'(x)\,\dd x. \label{eq:sfg}
+\end{align}
+Table~\ref{tab:1d-inners} gives closed-form values for all pairings;
+$w = hi-lo$ is the hat width.
+
+\begin{table}[h]
+\centering
+\caption{One-dimensional mass ($m$) and stiffness ($s$) inner products.
+${}^\dagger$ by symmetry ($f \leftrightarrow g$).}
+\label{tab:1d-inners}
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{ll@{\quad}l}
+\toprule
+$f$ & $g$ & $m(f,g)$ \\
+\midrule
+$1$                  & $1$                  & $1$ \\
+$1$                  & $x$                  & $\tfrac{1}{2}$ \\
+$1$                  & $\hat(\cdot;lo,hi)$  & $\tfrac{w}{2}$ \\
+$x$                  & $x$                  & $\tfrac{1}{3}$ \\
+$x$                  & $\hat(\cdot;lo,hi)$  & $lo\cdot\tfrac{w}{2} + \tfrac{w^2}{6}$ \\
+$\hat(\cdot;lo,hi)$  & $\hat(\cdot;lo,hi)$  & $\tfrac{w}{3}$ \\
+$\hat(\cdot;lo,hi)$  & $\hat(\cdot;lo,m)$\,${}^\dagger$
+                                             & $\tfrac{w}{8}$ \\
+$\hat(\cdot;lo,m)$   & $\hat(\cdot;m,hi)$   & $0$ \\
+\bottomrule
+\end{tabular}
+\qquad
+\begin{tabular}{ll@{\quad}l}
+\toprule
+$f$ & $g$ & $s(f,g)$ \\
+\midrule
+$1$                  & $\cdot$ (any)         & $0$ \\
+$x$                  & $x$                   & $1$ \\
+$x$                  & $\hat(\cdot;lo,hi)$   & $0$ \\
+$\hat(\cdot;lo,hi)$  & $\hat(\cdot;lo,hi)$   & $\tfrac{4}{w}$ \\
+$\hat(\cdot;lo,hi)$  & $\hat(\cdot;lo,m)$\,${}^\dagger$
+                                              & $0$ \\
+$\hat(\cdot;lo,m)$   & $\hat(\cdot;m,hi)$    & $0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+Key observations:
+\begin{itemize}
+  \item $s(1,\cdot) = 0$: the constant has zero derivative, contributing
+        nothing to the stiffness matrix.
+  \item $s(x, \hat) = 0$: by the fundamental theorem,
+        $\int_{lo}^{hi} 1 \cdot \hat'\,\dd x = \hat(hi) - \hat(lo) = 0$,
+        so the linear function is stiffness-orthogonal to every hat.
+  \item $s(\hat(lo,hi),\,\hat(lo,m)) = 0$: on $[lo,m]$ (the support of
+        $\hat_L$), the parent derivative $\hat'(x;lo,hi) = 2/w$ is constant,
+        so $\int_{lo}^m (2/w)\,\hat'_L\,\dd x = (2/w)[\hat_L(m)-\hat_L(lo)]
+        = 0$.
+  \item $s(\hat_L,\hat_R) = 0$: disjoint supports.
+\end{itemize}
+Consequently, \emph{all off-diagonal stiffness inner products vanish}: the
+stiffness matrix is diagonal.
+
+\subsection{Mass Matrix}
+\label{sec:hat-mass}
+
+\begin{proposition}[Tensor-product mass matrix]
+\label{prop:mass-new}
+For any two active basis functions $\phi_i$, $\phi_j$:
+\begin{equation}
+  C_{ij} = \int_{[0,1]^D} \phi_i(x)\,\phi_j(x)\,\dd x
+          = \prod_{d=1}^D m\!\bigl(f_{s_d^{(i)}},\, f_{s_d^{(j)}}\bigr).
+  \label{eq:hat-mass-new}
+\end{equation}
+\end{proposition}
+\begin{proof}
+$\phi_i\phi_j = \prod_d f_{s_d^{(i)}}(x_d)f_{s_d^{(j)}}(x_d)$.
+Fubini gives the product of 1D integrals.
+\end{proof}
+
+\paragraph{Sparsity.}
+$C_{ij} = 0$ when $m(f_{s_d^{(i)}},f_{s_d^{(j)}})=0$ for some $d$.
+From the table, this occurs when the dimension-$d$ states are sibling hats
+(zero support overlap).  In particular, the two children of any hat split
+have zero mass coupling.
+
+\paragraph{Block structure.}
+When node $k$ is split in dimension $d_0$, its children $k_L$ and $k_R$
+carry sibling hat states in that dimension, so $C_{ij} = 0$ for all
+$i\in\mathcal{A}_{k_L}$, $j\in\mathcal{A}_{k_R}$:
+\begin{equation}
+  C_{\mathcal{A}_{k_L},\,\mathcal{A}_{k_R}} = 0.
+  \label{eq:C-block-zero}
+\end{equation}
+Ancestors of $k$ (not yet split in $d_0$) couple to both subtrees and lie
+outside this block.  The mass matrix therefore has a \emph{recursive
+block-triangular} structure with blocks indexed by the subtrees of $\mathcal{T}$.
+
+\subsection{Stiffness Matrix}
+\label{sec:hat-stiffness}
+
+\begin{proposition}[Diagonal stiffness matrix]
+\label{prop:stiffness-new}
+$G$ is diagonal:
+\begin{equation}
+  G_{ij} = \delta_{ij}
+    \sum_{d=1}^D s\!\bigl(f_{s_d^{(i)}},\, f_{s_d^{(i)}}\bigr)
+    \prod_{d' \neq d} m\!\bigl(f_{s_{d'}^{(i)}},\, f_{s_{d'}^{(i)}}\bigr).
+  \label{eq:hat-stiffness-new}
+\end{equation}
+\end{proposition}
+\begin{proof}
+The general formula is $G_{ij} = \sum_d s(f_{s_d^{(i)}},f_{s_d^{(j)}})
+\prod_{d'\neq d}m(f_{s_{d'}^{(i)}},f_{s_{d'}^{(j)}})$.  Every off-diagonal
+$s$-factor vanishes (as shown in Section~\ref{sec:1d-inners}), so only the
+$i=j$ term survives.
+\end{proof}
+
+\noindent
+The diagonal entry $G_{kk}$ is the sum of $D$ terms, each equal to the
+stiffness self-product in one dimension times the mass self-product in
+all other dimensions.  For the root ($f_{s_d} = 1$ for all $d$), $G_{kk}=0$.
+For a node with all dimensions at ``const'' except dimension $d_0$ at
+$\hat(\cdot;lo,hi)$ (width $w$):
+\begin{equation}
+  G_{kk} = \frac{4}{w} \cdot \prod_{d \neq d_0} m(f_{s_d},f_{s_d}).
+  \label{eq:Gkk-example}
+\end{equation}
+
+\subsection{SPDE Operator and Prior}
+\label{sec:hat-spde}
+
+The FEM operator $K = \kappa^2 C + G$ combines the (sparse) mass matrix with
+the diagonal stiffness.  The $\alpha=2$ SPDE precision is
+\begin{equation}
+  Q = K C^{-1} K.
+  \label{eq:hat-Q-new}
+\end{equation}
+$C$ is sparse and positive definite, so $C^{-1}$ can be applied via sparse
+Cholesky; $K^{-1}$ (needed for HMC velocity refresh and CG solves) inherits
+the same sparsity.  The prior is $r \sim \mathcal{N}(0,\,\sigma^2 Q^{-1})$
+over all $|\mathcal{A}|$ active coefficients simultaneously.
+
+\paragraph{Likelihood.}
+For each observation $s_i$, the log-intensity sums over all active basis
+functions:
+\begin{equation}
+  \log\lambda(s_i) = \mu + \bphi(s_i)^T r,
+  \quad
+  \bphi(s_i)_k = \prod_{d=1}^D f_{s_d^{(k)}}(s_{i,d}).
+  \label{eq:hat-loglik-new}
+\end{equation}
+The constant contributes 1, the linear terms contribute the observation
+coordinates, and at most one hat per dimension is nonzero at $s_i$.
+The Poisson integral is approximated by a fixed quadrature rule.
+% ============================================================
+\section{Adaptive Piecewise-Constant Tree Basis}
+\label{sec:const-tree}
+% ============================================================
+
+The hat tree basis of Section~\ref{sec:hat-tree} pays a price for its smoothness:
+the active set must include \emph{every} ancestor (root, linears, coarse hats),
+and those ancestors overlap broadly --- the root constant overlaps every cell,
+each linear overlaps its whole slab --- so the mass matrix acquires dense rows as
+$D$ grows.  This section explores the opposite end of the regularity spectrum:
+keep the same adaptive dyadic refinement of $[0,1]^D$, but take the basis
+functions to be \emph{indicators of the leaf cells}.  The active set is then the
+\emph{leaves only}, and --- as we show --- this still yields a universal function
+approximator while making the mass matrix exactly diagonal.  The cost is that the
+SPDE operator can no longer be discretised by a conforming Galerkin stiffness
+matrix; it must be recast in finite-volume / GMRF form, which we develop and
+evaluate below.
+
+\subsection{Partition and Basis}
+\label{sec:const-partition}
+
+We refine $[0,1]^D$ with the same binary kd-tree as before: a cell is split at
+the midpoint of one axis into two children.  At any stage the \emph{leaves}
+$\{C_i\}_{i\in\mathcal{L}}$ form a partition of the domain into disjoint
+axis-aligned dyadic boxes,
+\begin{equation}
+  C_i = \prod_{d=1}^D I_d^{(i)},
+  \qquad
+  \bigcup_{i\in\mathcal{L}} C_i = [0,1]^D,
+  \quad
+  C_i \cap C_j = \emptyset \ (i\ne j),
+  \label{eq:const-partition}
+\end{equation}
+where each $I_d^{(i)}=[p/2^{n},(p+1)/2^n]$ is a dyadic subinterval.  The basis is
+the set of leaf indicators
+\begin{equation}
+  \phi_i(x) = \mathbf{1}[x\in C_i],
+  \qquad i\in\mathcal{L}.
+  \label{eq:const-basis}
+\end{equation}
+As with the hat tree, a leaf carries the product structure
+$C_i=\prod_d I_d^{(i)}$: it is indexed by a $D$-tuple of 1D dyadic addresses, the
+number of splits in dimension $d$ being the depth $n_d^{(i)}=\log_2(1/|I_d^{(i)}|)$.
+
+\subsection{Universal Approximation from Leaves Alone}
+\label{sec:const-ufa}
+
+\begin{proposition}[Density of refining indicators]
+\label{prop:const-ufa}
+Let $\delta(\mathcal{L})=\max_{i\in\mathcal{L}}\operatorname{diam}(C_i)$ be the
+mesh size.  As $\delta(\mathcal{L})\to0$, the span of $\{\phi_i\}_{i\in\mathcal{L}}$
+is dense in $L^2([0,1]^D)$, and for every $g\in C([0,1]^D)$ the piecewise-constant
+interpolant $\sum_i g(\bar x_i)\phi_i$ (with $\bar x_i$ the cell centroid)
+converges uniformly to $g$.
+\end{proposition}
+\begin{proof}
+The leaves partition the domain, so $\sum_i\phi_i\equiv1$ (partition of unity).
+For $g\in C([0,1]^D)$, uniform continuity gives
+$\sup_x|g(x)-\sum_i g(\bar x_i)\phi_i(x)|\le\omega_g(\delta(\mathcal{L}))\to0$,
+where $\omega_g$ is the modulus of continuity; uniform approximation of
+continuous functions implies $L^2$-density of the span by the density of
+$C([0,1]^D)$ in $L^2$.
+\end{proof}
+
+\begin{remark}[Why leaves suffice here but not for hats]
+This is the structural advantage over the hat tree.  A \emph{leaf hat} vanishes
+on the boundary of its support box, so the span of leaf hats alone contains only
+functions vanishing on every dyadic grid line --- not dense --- which is exactly
+why Section~\ref{sec:Ddim-basis} must include all ancestors.  Indicators instead
+\emph{tile} the domain and form a partition of unity, so no ancestors are needed:
+the active set is the leaf set, and there is no broadly-overlapping root or
+linear term.
+\end{remark}
+
+\subsection{Mass Matrix is Diagonal}
+\label{sec:const-mass}
+
+\begin{proposition}[Diagonal mass matrix]
+\label{prop:const-mass}
+For the leaf indicators \eqref{eq:const-basis},
+\begin{equation}
+  C_{ij} = \int_{[0,1]^D}\phi_i\phi_j\dd x
+         = \delta_{ij}\,|C_i|,
+  \qquad
+  |C_i| = \prod_{d=1}^D |I_d^{(i)}|.
+  \label{eq:const-mass}
+\end{equation}
+\end{proposition}
+\begin{proof}
+$\phi_i\phi_j=\mathbf{1}[x\in C_i\cap C_j]$, which is $\mathbf{1}[x\in C_i]$ for
+$i=j$ and $0$ otherwise because leaves are disjoint \eqref{eq:const-partition}.
+The integral of $\mathbf{1}[x\in C_i]$ is the cell volume.
+\end{proof}
+
+The mass matrix is therefore diagonal in \emph{every} dimension --- a strict
+improvement on the hat tree, whose ancestor functions couple to whole subtrees.
+The lumped and consistent mass matrices coincide ($\tilde C=C$), so the
+quadrature weights $c_i=|C_i|$ of the likelihood integral
+(\emph{Foundations} note, integral-approximation section) are exact cell volumes,
+and no buffer-node lumping approximation is incurred.
+
+\subsection{Stiffness: An Obstruction and Its Finite-Volume Resolution}
+\label{sec:const-stiffness}
+
+Here the piecewise-constant basis runs into a genuine obstruction, which we state
+plainly before resolving it.
+
+\begin{proposition}[The conforming stiffness matrix does not exist]
+\label{prop:const-stiff-illdef}
+Indicator functions are not in $H^1([0,1]^D)$: the distributional gradient of
+$\phi_i=\mathbf 1[x\in C_i]$ is a (vector-valued) surface measure supported on
+$\partial C_i$, not an $L^2$ function.  Consequently the Galerkin stiffness
+integral $G_{ij}=\int\nabla\phi_i\cdot\nabla\phi_j\dd x$ is undefined (formally
+divergent), and the weak form of the \emph{Foundations} note --- which integrates
+by parts and requires $\phi_i\in H^1$ --- does not apply.
+\end{proposition}
+
+In other words the claim ``the stiffness matrix stays sparse'' cannot be taken at
+face value: there is no conforming stiffness matrix to speak of.  What survives
+is a \emph{discrete} second-order operator built from cell adjacencies, in the
+spirit of finite-volume schemes and Gaussian Markov random fields (GMRFs).
+
+\paragraph{Adjacency and the finite-volume operator.}
+Call two leaves $i,j$ \emph{adjacent}, $i\sim j$, if their closures share a
+$(D{-}1)$-dimensional face $F_{ij}$ of positive area.  Discretising
+$-\nabla\cdot\nabla$ by a two-point flux across each shared face gives the
+sparse, symmetric operator
+\begin{equation}
+  G^{\mathrm{FV}}_{ij} =
+  \begin{cases}
+    -\,w_{ij}, & i\sim j,\quad
+      w_{ij}=\dfrac{|F_{ij}|}{\lVert \bar x_i-\bar x_j\rVert},\\[1.2ex]
+    \ \sum_{k\sim i} w_{ik}, & i=j,\\[0.6ex]
+    \ 0, & \text{otherwise},
+  \end{cases}
+  \label{eq:const-fv}
+\end{equation}
+with $\bar x_i$ the cell centroid and $|F_{ij}|$ the shared-face area.  This is a
+weighted graph Laplacian on the cell-adjacency graph; the precision
+\begin{equation}
+  Q = \kappa^2 C + G^{\mathrm{FV}},
+  \qquad C=\diag(|C_i|),
+  \label{eq:const-Q}
+\end{equation}
+is exactly a Besag-type GMRF (a conditional-autoregression), and is sparse and
+positive definite for $\kappa>0$.  It coincides with the standard finite-volume
+discretisation of $(\kappa^2-\Delta)$ on the dual mesh.
+
+\begin{proposition}[Sparsity is retained in all dimensions]
+\label{prop:const-sparse}
+With $C$ diagonal \eqref{eq:const-mass} and $G^{\mathrm{FV}}$ coupling only
+face-adjacent leaves \eqref{eq:const-fv}, the number of nonzeros of $Q$ is
+$|\mathcal{L}| + 2\,\#\{\text{internal faces}\}$, independent of any global
+``ancestor'' coupling.  In particular $Q$ has no dense rows, in contrast to the
+hat tree, whose root and linear functions couple to $\Theta(|\mathcal{A}|)$ basis
+functions each.
+\end{proposition}
+
+\paragraph{Evaluation of the claim.}
+The original conjecture --- that the mass and stiffness matrices ``do not become
+dense as $D$ increases'' --- is therefore \emph{partly true and worth a precise
+verdict}:
+\begin{itemize}
+  \item \textbf{Mass matrix: true, and strictly better than the hat tree.}
+        It is diagonal in every dimension (Proposition~\ref{prop:const-mass}).
+  \item \textbf{Stiffness matrix: true only after reinterpretation.}  A
+        conforming $H^1$ stiffness matrix does \emph{not exist}
+        (Proposition~\ref{prop:const-stiff-illdef}); the right object is the
+        finite-volume / GMRF operator \eqref{eq:const-fv}, which \emph{is} sparse
+        and free of dense ancestor rows (Proposition~\ref{prop:const-sparse}).
+\end{itemize}
+Three caveats temper the win:
+\begin{enumerate}
+  \item \textbf{Adaptive adjacency is irregular.}  Under non-uniform refinement a
+        coarse leaf can be face-adjacent to many small leaves, so the per-row
+        degree of $G^{\mathrm{FV}}$ is not uniformly $2D$; the matrix is sparse
+        but its bandwidth depends on the refinement balance.  Finding the
+        face-neighbours of a kd-tree leaf is also more work than the hat tree's
+        $O(D)$ tensor update.
+  \item \textbf{Rougher prior.}  Piecewise-constant fields are discontinuous, so
+        the basis represents an intrinsically rough field; the operator
+        \eqref{eq:const-Q} is a consistent discretisation only of the roughest
+        Mat\'ern regime, and the smoothness parameter $\nu$ loses its
+        finite-element interpretation.  (One recovers smoother fields only by
+        refining, or by switching to higher-order discontinuous-Galerkin
+        elements with interior-penalty face terms, which reintroduce face
+        coupling of the same sparsity class.)
+  \item \textbf{Same GMRF, different CG constant.}  Because \eqref{eq:const-Q} is
+        a Besag CAR precision, the dimension-robust samplers of the
+        \emph{Sampling Methods} note apply verbatim (the CG conditioning argument
+        there is stated for exactly this $Q=\kappa^2 I + L_{\mathrm{graph}}$
+        form).
+\end{enumerate}
+
+\subsection{Non-Uniqueness, and the Same Canonical Fix}
+\label{sec:const-uniqueness}
+
+The piecewise-constant basis inherits the non-uniqueness of
+Section~\ref{sec:uniqueness}.  A leaf box $C_i=\prod_d I_d^{(i)}$ is reached by
+cutting dimension $d$ a total of $n_d^{(i)}$ times, and --- by the same
+commutation argument (Proposition~\ref{prop:commute}) --- cuts in distinct
+dimensions commute: splitting a cell along $X$ and then its children along $Y$
+produces the \emph{same} $2\times2$ partition as splitting along $Y$ then $X$.
+Hence many distinct kd-trees realise the same leaf partition, and therefore the
+same basis; the number of split orders reaching a given leaf is again the
+multinomial $\binom{\sum_d n_d}{n_1,\dots,n_D}$ of Eq.~\eqref{eq:fibre-count}.
+
+\begin{remark}[What is redundant here]
+For the hat tree the redundancy is over birth \emph{paths} to a single
+basis function $\phi_s$; for the constant tree it is over kd-\emph{trees}
+generating the same leaf \emph{partition} $\{C_i\}$.  In both cases the honest
+index is geometric (the state vector / the leaf box), not the tree.
+\end{remark}
+
+The fix is identical to Section~\ref{sec:uniqueness}: impose the total order
+$1<2<\cdots<D$ and keep the canonical (sorted) split history, equivalently demote
+the highest-indexed cut via the canonical parent \eqref{eq:canon-parent}.  The
+state-local admissibility rule \eqref{eq:canon-birth-rule} carries over verbatim
+--- within a cell's split lineage, a cut in dimension $d$ is allowed only if no
+higher-indexed dimension has been cut --- making the tree-to-partition map a
+bijection and removing the double-counting from the RJMCMC move counts.
+
+% ============================================================
+\section{Baseline (Level 1): Adaptive Triangulation FEM}
+\label{sec:baseline}
+\label{sec:adaptive-tri}
+% ============================================================
+
+This section documents the original Level-1 pipeline: an adaptive kd-tree mesh,
+a Delaunay triangulation of its nodes, and piecewise-linear hat functions on the
+resulting simplices.  It predates the adaptive tree hat basis of
+Section~\ref{sec:hat-tree} and has since been superseded by it, for the reasons
+recorded in Appendix~\ref{sec:lessons}: the simplex count grows
+super-exponentially with dimension and the triangulation is not static under
+refinement.  We retain the construction here because it is the concrete instance
+behind the general FEM framework of the companion \emph{Foundations} note, and
+because the likelihood, hyperparameter, anisotropic, and RJMCMC machinery were
+all first developed on it.
+
+\subsection{Recursive Equal-Count kd-Tree}
+
+We build a mesh that is automatically denser where the observed point pattern is
+dense.  Starting from a root cell covering the domain, we recursively split
+each cell along its longest axis at the data median until every leaf cell
+contains at most $n_{\max}$ points (the refinement threshold).  This is a
+\emph{balanced} kd-tree partition: each split divides the data approximately
+evenly, so the resulting leaf sizes are $O(n/n_{\rm leaves})$.
+
+The split value is clamped away from the cell boundary by a relative tolerance
+$\epsilon = 10^{-8}$ of the cell width, ensuring no degenerate child cell.
+
+\subsection{Mesh Nodes and Delaunay Triangulation}
+
+Each leaf cell contributes one node to the mesh: the centroid of its data
+points if the cell is non-empty, or the geometric cell midpoint otherwise.
+The $2^d$ corners of the bounding box are added as fixed boundary nodes.
+
+The Delaunay triangulation of all nodes defines the mesh $\mathcal{T}$.
+It is rebuilt from scratch after each refinement or coarsening step.
+
+\subsection{Buffer Region}
+
+To ensure the triangulation is regular near the domain boundary, the bounding
+box is taken slightly larger than the observation domain---typically
+$[-0.1, 1.1]^2$ when observations lie in $[0,1]^2$.  This introduces
+\emph{buffer nodes} in the extended region.  We account for them explicitly in
+the likelihood (companion \emph{Foundations} note).
+
+\subsection{Basis Functions and Local Geometry}
+
+On the triangulation $\mathcal{T}$ with $m$ nodes and $T$ simplices, we use
+piecewise linear \emph{hat} basis functions $\{\phi_i\}_{i=1}^m$.  The hat
+function $\phi_j$ equals 1 at node $j$, 0 at every other node, and varies
+linearly in between.  Within any single simplex it is a flat tilted plane, so
+its gradient is \emph{constant} on each simplex and can be computed from
+geometry alone.
+
+\paragraph{Reference simplex and the map $B_\tau$.}
+Every computation is carried out on a fixed \emph{reference simplex}
+$\hat\tau$ with vertices at the origin $\hat{v}_0=\mathbf{0}$ and the
+standard basis vectors $\hat{v}_k = e_k$ for $k=1,\ldots,d$.  On this
+template the hat functions are trivially
+\[
+  \hat\phi_0(\hat s) = 1 - \hat s_1 - \cdots - \hat s_d, \qquad
+  \hat\phi_k(\hat s) = \hat s_k \;\;(k\ge 1),
+\]
+with reference gradients $\nabla_{\hat s}\hat\phi_j = \hat{e}_j$, where
+$\hat{e}_0 = -\mathbf{1}$ and $\hat{e}_k$ is the $k$-th standard basis
+vector.
+
+The matrix
+\begin{equation}
+  B_\tau = [v_1 - v_0, \;\ldots\;, v_d - v_0] \in \R^{d\times d}
+\end{equation}
+maps the reference simplex to the physical simplex $\tau$ via
+$s = v_0 + B_\tau\hat s$.  Its columns are the edge vectors of $\tau$
+emanating from $v_0$, so $B_\tau$ encodes the shape and orientation of the
+triangle.  The volume follows immediately: $|\tau| = |\det B_\tau|/d!$.
+
+\paragraph{Why $B_\tau^{-\top}$ for gradients.}
+The gradient $\nabla_s\phi_j^{(\tau)}$ is the vector $g$ satisfying
+$g\cdot\delta s = \delta\phi$ for every physical displacement $\delta s$.
+Writing $\delta s = B_\tau\,\delta\hat s$ and using the reference gradient
+$\nabla_{\hat s}\hat\phi_j = \hat{e}_j$:
+\[
+  g \cdot B_\tau\,\delta\hat s
+  = \hat{e}_j \cdot \delta\hat s
+  \quad\text{for all }\delta\hat s,
+\]
+which gives $B_\tau^{\top}g = \hat{e}_j$, and therefore
+\begin{equation}
+  \nabla_s \phi_j^{(\tau)} = B_\tau^{-\top}\hat{e}_j, \quad j = 0, \ldots, d.
+  \label{eq:grad-phi}
+\end{equation}
+Intuitively, $B_\tau^{-1}$ converts a physical direction into reference
+coordinates, and the transpose accounts for the fact that gradients scale
+inversely with distances (a squeezed triangle has steeper slopes).  Because
+$B_\tau$ is constant on $\tau$, so is $\nabla_s\phi_j^{(\tau)}$: the hat
+function is a flat ramp, and \eqref{eq:grad-phi} gives its slope.
+
+\subsection{Mass Matrix}
+\label{sec:mass}
+
+The mass matrix $C \in \R^{m\times m}$ has entries
+\begin{equation}
+  C_{ij} = \int_\mathcal{D} \phi_i(s)\phi_j(s) \dd s
+         = \sum_{\tau \ni i,j} |\tau| \frac{1 + \delta_{ij}}{(d+1)(d+2)}.
+  \label{eq:mass}
+\end{equation}
+$C_{ij}$ measures the \emph{overlap} between hat functions $\phi_i$ and
+$\phi_j$: it is nonzero only when nodes $i$ and $j$ share at least one
+simplex.  The diagonal entry $C_{ii}$ is proportional to the total area of
+all simplices containing node $i$.  The matrix is symmetric positive definite
+with sparsity matching the mesh topology.
+
+The \emph{row sum} $\tilde{c}_j = (C\mathbf{1})_j = \sum_k C_{jk}$ is the
+total area ``owned'' by node $j$: it equals $\sum_{\tau\ni j}|\tau|/(d+1)$,
+the average share of each incident simplex.  Geometrically, $\tilde{c}_j$
+approximates the area of the Voronoi cell\footnote{It's not really a Voronoi cell, but it's close-ish to one depending on the triangulation.} around node $j$.  The diagonal
+matrix $\tilde{C} = \diag(C\mathbf{1})$ is the \emph{lumped} mass matrix,
+used in the companion \emph{Foundations} note to approximate the Poisson integral
+as a weighted sum $\sum_j \tilde{c}_j \lambda_j$.
+
+In the SPDE operator $(\kappa^2 - \Delta)$, the term $\kappa^2$ acts like a
+scalar multiple of the identity on functions.  After Galerkin projection onto
+the hat-function basis, this becomes $\kappa^2 C$: the mass matrix is the
+FEM discretisation of the identity operator, weighted by local area.
+
+\subsection{Stiffness Matrix}
+\label{sec:stiffness}
+
+The stiffness matrix $G \in \R^{m\times m}$ has entries
+\begin{equation}
+  G_{ij} = \int_\mathcal{D} \nabla\phi_i(s) \cdot \nabla\phi_j(s) \dd s
+         = \sum_{\tau \ni i,j} |\tau| \, \nabla\phi_i^{(\tau)} \cdot \nabla\phi_j^{(\tau)}.
+  \label{eq:stiff}
+\end{equation}
+$G_{ij}$ measures how much nodes $i$ and $j$ \emph{resist spatial variation}
+together: it is the inner product of the slopes of the two hat functions.
+By integration by parts, $\mathbf{x}^T G\, \mathbf{x} =
+\int|\nabla x(s)|^2\dd s$, so the quadratic form in $G$ is exactly the total
+squared-gradient energy of the piecewise-linear field
+$x(s)=\sum_j x_j\phi_j(s)$.  Smooth fields (small gradients everywhere) have
+low $G$-energy; rough or wiggly fields have high $G$-energy.
+
+Equivalently, $G$ discretises the negative Laplacian $-\Delta$: it can be
+thought of as a network of \emph{springs} connecting adjacent nodes, where
+$G_{ij}$ is (minus) the spring constant for the edge between $i$ and $j$.
+For a Delaunay mesh in 2D, $G_{ij} \le 0$ for all neighbours
+($i\neq j$), and the action $(G\mathbf{x})_i = -\sum_j G_{ij}(x_j - x_i)$
+sums the spring forces pulling node $i$ toward its neighbours' values.
+
+Together, $K = \kappa^2 C + G$ discretises $(\kappa^2 - \Delta)$: the mass
+term $\kappa^2 C$ penalises large \emph{absolute} values of the field, and
+the stiffness term $G$ penalises spatial \emph{roughness}.  Large $\kappa$
+makes the mass term dominate, producing a field with short correlation length
+(rapidly decorrelated); small $\kappa$ lets the stiffness term dominate,
+producing a smoother field correlated over longer distances.
+
+For the generalised, spatially varying-diffusion case
+$(\kappa(s)^2-\nabla\cdot H(s)\nabla)^{\alpha/2}x=\mathcal{W}$ (companion
+\emph{Foundations} note), the integrand becomes
+$\nabla\phi_i^T H(\bar\tau) \nabla\phi_j$ where $H$ is evaluated at the
+simplex centroid $\bar\tau$: the anisotropic diffusion tensor $H$ stretches
+the spring network directionally, making correlations longer in some
+directions than others.
+% ============================================================
+\section{Stationary Anisotropic Extension}
+\label{sec:anisotropic}
+% ============================================================
+
+This extension was developed on the triangulation baseline
+(Section~\ref{sec:baseline}), where per-simplex gradients make the
+diffusion-tensor assembly natural; the same construction carries over to the
+adaptive tree basis through its diagonal stiffness matrix.  We keep the simplex
+presentation here because that is where it was first worked out.
+
+\subsection{Anisotropy Matrix Parameterisation}
+
+The isotropic model (companion \emph{Foundations} note) treats all directions
+equally through a scalar range parameter $\kappa$.  A stationary
+\emph{anisotropic} generalisation retains a constant diffusion tensor $H$ in the
+generalised SPDE $(\kappa^2-\nabla\cdot H\nabla)^{\alpha/2}x=\mathcal{W}$
+(companion \emph{Foundations} note).  In $\R^2$ we parameterise
+\begin{equation}
+  H = R(\theta)\,\diag(\kappa_x^2,\,\kappa_y^2)\,R(\theta)^T,
+  \label{eq:H-param}
+\end{equation}
+where $R(\theta)$ is the $2\times 2$ rotation matrix and $\kappa_x, \kappa_y > 0$
+are effective range parameters along the principal axes of the field.
+The elements of $H$ are
+\begin{align}
+  h_{11} &= \kappa_x^2\cos^2\!\theta + \kappa_y^2\sin^2\!\theta, \nonumber\\
+  h_{12} &= (\kappa_x^2 - \kappa_y^2)\cos\theta\sin\theta,           \label{eq:H-components} \\
+  h_{22} &= \kappa_x^2\sin^2\!\theta + \kappa_y^2\cos^2\!\theta.    \nonumber
+\end{align}
+The three parameters $(\log\kappa_x,\, \log\kappa_y,\, \theta)$ replace the
+single scalar $\log\kappa$ from the isotropic model; the marginal variance
+$\sigma$ remains a scalar.  The isotropic case is recovered by setting
+$\kappa_x = \kappa_y$ (any $\theta$), yielding $H = \kappa_x^2 I$.
+
+\subsection{FEM Basis Decomposition}
+\label{sec:aniso-fem}
+
+The anisotropic stiffness matrix
+\[
+G_{H,ij} = \int_\mathcal{D} \nabla\phi_i^T H\,\nabla\phi_j\,\dd s
+\]
+decomposes linearly over three basis matrices:
+\begin{equation}
+  G_H = h_{11}\,G_{xx} + h_{12}\,G_{xy} + h_{22}\,G_{yy},
+  \label{eq:GH-decomp}
+\end{equation}
+with
+\begin{align}
+  G_{xx,ij} &= \sum_\tau |\tau|\,
+    \partial_x\phi_i^{(\tau)}\,\partial_x\phi_j^{(\tau)}, \\
+  G_{yy,ij} &= \sum_\tau |\tau|\,
+    \partial_y\phi_i^{(\tau)}\,\partial_y\phi_j^{(\tau)}, \\
+  G_{xy,ij} &= \sum_\tau |\tau|\!\left(
+    \partial_x\phi_i^{(\tau)}\,\partial_y\phi_j^{(\tau)}
+    + \partial_y\phi_i^{(\tau)}\,\partial_x\phi_j^{(\tau)}\right).
+\end{align}
+All three matrices are assembled once from the fixed mesh prior to sampling and
+stored in COO sparse format.  The isotropic $G = G_{xx} + G_{yy}$ is the
+special case $H = I$.
+
+At each NUTS step, forming $G_H$ costs three sparse scalar-matrix additions, and
+the SPDE operator
+\begin{equation}
+  K(H) = C + G_H(H)
+  \label{eq:K-aniso}
+\end{equation}
+has the same sparsity pattern as the isotropic $K(\kappa)$.  Matrix--vector
+products $K(H)\bx$ therefore cost $O(\mathrm{nnz}) \approx O(m)$ via COO
+scatter-add, unchanged from the isotropic case.
+
+\subsection{Log-Determinant Challenge}
+\label{sec:logdet-aniso}
+
+The companion \emph{Foundations} note showed that for the isotropic operator
+$K(\kappa) = \kappa^2 C + G$, the log-determinant reduces to $O(m)$ work per step
+once the generalised eigenpairs $G v_i = \mu_i C v_i$ have been precomputed:
+\[
+  \log|K(\kappa)| = \log|C| + \textstyle\sum_i \log(\kappa^2 + \mu_i).
+\]
+This is possible because $K$ is a \emph{scalar-affine} function of the single
+parameter $\kappa^2$: the eigenvectors $\{v_i\}$ are fixed and only the
+eigenvalues shift.
+
+For the anisotropic operator \eqref{eq:K-aniso}, the matrix
+$K(H) = C + h_{11}G_{xx} + h_{12}G_{xy} + h_{22}G_{yy}$
+is a linear combination of four sparse matrices whose coefficients
+$(h_{11}, h_{12}, h_{22})$ all change at every NUTS step.  No fixed eigenbasis
+can diagonalise $K(H)$ for all $H$ simultaneously: a generalised eigenproblem
+$K(H) v = \mu C v$ would need to be resolved whenever $(h_{11}, h_{12}, h_{22})$
+changes.
+
+Consequently, evaluating $\log|K(H)|$ requires a dense factorisation at each
+leapfrog step,
+\begin{equation}
+  \log|K(H)| = \texttt{slogdet}\bigl(K(H)\bigr),
+  \quad\text{cost } O(m^3) \text{ per step.}
+  \label{eq:slogdet-aniso}
+\end{equation}
+The gradient required by NUTS,
+\begin{equation}
+  \frac{\partial\log|K|}{\partial\theta_k}
+  = \tr\!\left(K^{-1}\frac{\partial K}{\partial\theta_k}\right),
+  \label{eq:grad-logdet-aniso}
+\end{equation}
+requires an implicit $K^{-1}$ solve for each of the three anisotropy
+parameters $(\log\kappa_x, \log\kappa_y, \theta)$, which JAX's automatic
+differentiation of \texttt{jnp.linalg.slogdet} provides via the implicit
+function theorem, again at $O(m^3)$ cost.
+
+For meshes of size $m \lesssim 500$ the per-step $O(m^3)$ cost is acceptable
+($\approx\!1$\,ms on a modern CPU), but it precludes scaling to
+$m \gtrsim 2000$.  Finding an efficient $O(m)$--$O(m\log m)$ approximation
+to $\log|K(H)|$ for parametric matrix pencils is an \textbf{open problem}.
+
+\begin{remark}[Stochastic Lanczos quadrature]
+One promising direction is \emph{stochastic Lanczos quadrature} (SLQ):
+estimate $\log|K|$ as $m\cdot\E_{\mathbf{u}}[\log\tilde\mu(\mathbf{u})]$,
+where $\tilde\mu$ is a stochastic Gauss quadrature approximation to the
+spectral measure of $K$, requiring only matrix--vector products with $K$
+(which remain $O(m)$).  The gradient \eqref{eq:grad-logdet-aniso} can be
+obtained by differentiating the Gauss nodes and weights with respect to $H$.
+This approach is left for future work.
+\end{remark}
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\appendix
+
+\section{Lessons Learned and Paths Avoided}
+\label{sec:lessons}
+
+This appendix records design decisions that were made, approaches that were
+tried and abandoned, and reasons why certain seemingly natural paths turned out
+to be dead ends.  It is intended as a living lab-notebook entry: when a
+promising direction is ruled out, the reasoning should be recorded here so it
+need not be rediscovered later.
+
+\subsection{Delaunay Triangulation Does Not Scale to Higher Dimensions}
+\label{sec:lesson-delaunay}
+
+The Level-1 method (Section~\ref{sec:baseline}) builds a Delaunay
+triangulation of the domain and assembles FEM matrices over the resulting
+simplices.  Two obstacles make this approach untenable in dimensions $D \ge 3$
+or even in $D=2$ once adaptive resolution is required.
+
+\paragraph{Combinatorial explosion of simplices.}
+The standard Freudenthal--Kuhn triangulation of $[0,1]^D$ decomposes the
+hypercube into exactly $D!$ simplices, one per permutation of the coordinate
+axes~\citep{freudenthal1942}.  More efficient triangulations exist: the best
+known construction achieves roughly $(0.816)^D \cdot D!$ simplices
+\citep{ordensantos2003}, and current lower bounds~\citep{glazyrin2012} are
+weaker still.  The precise minimum (the \emph{simplexity} of the $D$-cube)
+remains an open problem in combinatorial geometry.  In any case all known
+constructions and lower bounds grow super-exponentially in $D$: for $D=4$ the
+Freudenthal triangulation already uses $4! = 24$ top-dimensional simplices per
+unit hypercube, so a grid of $n^D$ points produces $O(n^D \cdot D!)$ simplices
+and FEM matrix assembly over all of them is prohibitive.
+
+\paragraph{Non-stationarity of the triangulation under refinement.}
+Adaptive resolution requires adding new vertices to the mesh.  Inserting a
+point into a Delaunay triangulation triggers a Bowyer--Watson cascade of
+simplex flips whose extent is unpredictable (it depends on the local geometry).
+This means the mesh is \emph{not static}: the full triangulation, and hence the
+FEM matrices $C$ and $G$, must be recomputed from scratch after every RJMCMC
+birth or death move.  The cost per move is therefore $O(m \log m)$ just for
+retriangulation, before any matrix assembly.
+
+\paragraph{Conclusion.}
+Delaunay triangulation is a natural first choice but hits a fundamental
+combinatorial wall in higher dimensions and does not compose well with adaptive
+sampling.  We abandon it in favour of the hat-function tree basis described in
+Section~\ref{sec:hat-tree}.
+
+\subsection{Hat-Function Tree Basis as the Natural Replacement}
+\label{sec:lesson-tree-basis}
+
+The adaptive hierarchical basis (Section~\ref{sec:hat-tree}) resolves both
+obstacles above.
+
+\begin{itemize}
+  \item \textbf{No combinatorial explosion.}
+    A $D$-dimensional basis function is the product of $D$ one-dimensional
+    functions (constant, linear, or hat).  Adding a node to the tree requires
+    only $O(D)$ work to compute its states and at most $O(D)$ new inner
+    products to update $C$ and $G$; no global retriangulation is needed.
+  \item \textbf{Static structure under refinement.}
+    The mass and stiffness matrices have a \emph{recursive block structure}
+    tied to the tree (Section~\ref{sec:hat-mass}).  A birth move in dimension
+    $d$ splits one block into sub-blocks; existing off-diagonal blocks are
+    unchanged (sibling hats have zero mass overlap, Eq.~\eqref{eq:C-block-zero}).
+    The stiffness matrix $G$ is diagonal and stays diagonal after any birth
+    (Section~\ref{sec:hat-stiffness}).  FEM matrix updates are therefore local
+    and $O(1)$ per move.
+  \item \textbf{Natural low-to-high resolution ordering.}
+    The tree encodes a multi-resolution hierarchy: the root is the constant
+    function~1, and successive refinements add finer and finer hat functions.
+    This gives a principled prior over resolution and a natural initialisation
+    (start at the root, i.e., a constant intensity field) rather than requiring
+    an expensive high-resolution mesh as the initial condition.
+\end{itemize}
+
+
+\end{document}

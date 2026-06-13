@@ -45,22 +45,36 @@ jupyter notebook
 jupyter lab
 ```
 
-## Lab Notebook (`draft/main.tex`)
+## Lab Notebook (`draft/`)
 
-The LaTeX document in `draft/` functions as a **lab notebook**: it documents
-experiments, derives the mathematics, and records design decisions as they are
-made.  It is not a polished paper.
+The LaTeX documents in `draft/` function as a **lab notebook**: they document
+experiments, derive the mathematics, and record design decisions as they are
+made.  They are not a polished paper.
+
+The notebook is split into **three standalone documents** that share a common
+`preamble.tex` (packages, macros, theorem environments) and `refs.bib`, each
+independently compilable on Overleaf:
+
+| File | Topic |
+|---|---|
+| `foundations.tex` | Problem setting, Mat\'ern SPDE prior, basis-agnostic FEM/Galerkin weak form and precision matrix, likelihood discretisation, hyperparameter model, NUTS. The shared substrate. |
+| `approximators.tex` | Universal function approximators on $[0,1]^D$: the adaptive **hat tree basis** (`\label{sec:hat-tree}`, primary; includes the uniqueness/`sec:uniqueness` analysis), the adaptive **piecewise-constant tree basis** (`\label{sec:const-tree}`), the **Delaunay-triangulation baseline** (`\label{sec:baseline}`, demoted Level 1), the stationary anisotropic extension, and the **Lessons Learned** appendix (`\label{sec:lessons}`). |
+| `samplers.tex` | Reversible-jump MCMC over the refinement tree (`\label{sec:rjmcmc}`) and dimension-robust infinite-dimensional samplers (pCN, Hilbert-space HMC) for BlackJAX. |
+
+Because the documents compile separately, **cross-document references are written
+as plain text** (e.g. "the companion *Foundations* note"), not `\ref` — only
+within-document targets use `\ref`/`\eqref`/`\label`.
+
+`main.tex` is the **superseded monolith** that predates the split; it is kept
+only until the split is confirmed on Overleaf, then should be removed.  Do not
+edit it — make changes in the three split documents.
 
 **Compilation happens on Overleaf**, not locally — the draft is attached to an
 Overleaf project.  Do not attempt to `pdflatex`/`latexmk` it locally to "verify"
 (the local TeX install is missing packages such as `algpseudocode`, so it will
-fail for environmental reasons unrelated to the edit).  Edit `main.tex` directly
-and let the user compile on Overleaf.  When changing structure, sanity-check
-`\ref`/`\label` consistency by inspection rather than by building.
-
-The document centres on the **adaptive tree hat basis** on $[0,1]^D$
-(`\label{sec:hat-tree}`) as the primary method; the Delaunay-triangulation FEM
-pipeline is retained as the demoted Level-1 baseline (`\label{sec:baseline}`).
+fail for environmental reasons unrelated to the edit).  Edit the split documents
+directly and let the user compile on Overleaf.  When changing structure,
+sanity-check `\ref`/`\label` consistency by inspection rather than by building.
 
 **Appendix: Lessons Learned and Paths Avoided** (`\label{sec:lessons}`) is a
 running record of approaches that were explored and ruled out, together with the

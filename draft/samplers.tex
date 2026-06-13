@@ -1,0 +1,438 @@
+\documentclass[11pt]{article}
+\input{preamble}
+
+\title{Sampling Methods: Reversible-Jump MCMC and\\
+Infinite-Dimensional (Dimension-Robust) Samplers}
+\author{Jack Heinzel}
+\date{Draft --- \today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note covers the Monte Carlo machinery used to sample the discretised LGCP
+posterior set up in the companion \emph{Foundations} note.  Two ingredients are
+developed.  First, reversible-jump MCMC \citep{green1995} over the refinement
+tree, which makes the number of active basis functions a random variable; the
+birth/death moves and their acceptance ratio are presented on the triangulation
+baseline and carry over verbatim to the adaptive tree bases of the companion
+\emph{Universal Function Approximators} note.  Second, \emph{dimension-robust}
+within-model samplers --- preconditioned Crank--Nicolson (pCN) and Hilbert-space
+HMC --- whose efficiency does not degrade as the discretisation is refined,
+together with a scheme that nests them inside the transdimensional moves.  The
+implementation targets BlackJAX-compatible kernels.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+% ============================================================
+\section{Adaptive Refinement via Reversible-Jump MCMC}
+\label{sec:rjmcmc}
+% ============================================================
+
+The number of active basis functions is itself unknown, so we sample it with
+reversible-jump MCMC \citep{green1995}.  For the adaptive tree basis (companion
+\emph{Universal Function Approximators} note) a \emph{birth move} advances one
+node one step in its local hierarchy (const $\to$ linear $\to$ unit hat $\to$
+sub-hat), adding one coefficient; a \emph{death move} reverses it.  Because
+sibling hats have zero mass and stiffness overlap (the recursive-block structure
+established there), each move updates the FEM matrices in $O(D)$ work with no
+global rebuild.  We first present the scheme in its original form on the
+triangulation baseline, where a node corresponds to a triangle and a birth
+performs a ternary simplex split; the acceptance ratio below is identical for the
+tree basis, with the local FEM updates replaced by the closed forms of that note.
+
+\subsection{Refinement Tree}
+
+We augment the static triangulation with a \emph{ternary refinement tree}.
+Every triangle in the initial mesh is a root.  A \emph{birth move} splits a
+leaf triangle $\tau^*$ at its barycenter $s^*$, replacing $\tau^*$ by the
+three child triangles $(s^*,v_0,v_1)$, $(s^*,v_1,v_2)$, $(s^*,v_0,v_2)$.
+A \emph{death move} is the exact reverse: if all three children of an
+interior node $s^*$ are currently leaves, they are merged back into their
+parent $\tau^*$ and $s^*$ is removed.  Birth and death are exact inverses,
+so detailed balance is achievable.
+
+Let $N_m$ be the number of leaf (birth-eligible) triangles and $M_m$ the
+number of removable (death-eligible) nodes in mesh $m$.  After a birth on
+$\tau^*$:
+\begin{equation}
+  N_{m'} = N_m + 2, \qquad
+  M_{m'} = M_m + 1
+           - \mathbf{1}\bigl[\text{all-leaf children test fails for parent}(s^*)\bigr],
+  \label{eq:NM-update}
+\end{equation}
+where parent$(s^*)$ is the node whose earlier birth created $\tau^*$
+(undefined for root triangles, so the indicator is 0 there).
+
+\subsection{Conditional Prior Proposal}
+\label{sec:rj-proposal}
+
+After the 3-split the extended mesh $m'$ has $n_m+1$ nodes.  The SPDE prior
+on the augmented field $(\mathbf{x}_m,x^*)$ is
+$\mathcal{N}(0,\sigma^2 Q'^{-1})$ with $Q'=K'(\tilde{C}')^{-1}K'$.
+Partitioning $Q'$ into the old nodes $(-*)$ and the new node $(*)$:
+\begin{equation}
+  Q' = \begin{pmatrix} Q'_{-*} & (Q'_{*-})^T \\ Q'_{*-} & Q'_{**} \end{pmatrix},
+\end{equation}
+the conditional prior of $x^*$ given the existing field is the
+one-dimensional Gaussian
+\begin{equation}
+  x^*\mid\mathbf{x}_m,m',\kappa,\sigma
+  \;\sim\; \mathcal{N}\!\left(\bar{x}^*,\;\frac{\sigma^2}{Q'_{**}}\right),
+  \qquad
+  \bar{x}^* = -\frac{Q'_{*-}\,\mathbf{x}_m}{Q'_{**}}.
+  \label{eq:cond-prior-rj}
+\end{equation}
+Since $s^*$ connects only to $\{v_0,v_1,v_2\}$ in the mesh graph,
+$K'_{*j}=0$ for $j\notin\{*,v_0,v_1,v_2\}$, and therefore
+$Q'_{*j} = \sum_{k\in\{*,v_0,v_1,v_2\}} K'_{*k}(\tilde{c}'_k)^{-1}K'_{kj}$.
+Both $Q'_{**}$ and $Q'_{*-}$ depend on $O(1)$ FEM values assembled from the
+three new triangles; their evaluation is an $O(1)$ local computation.
+
+\subsection{RJMCMC Acceptance Ratio}
+\label{sec:rj-acceptance}
+
+We propose $x^*$ from the conditional prior $q_*(x^*)=p(x^*\mid\mathbf{x}_m,m',\kappa,\sigma)$.
+The standard \citet{green1995} acceptance ratio for the birth move is
+\begin{equation}
+  \alpha_\mathrm{b} = \min\!\left(1,\;
+    \frac{\pi(m',\,\mathbf{x}_{m'})}
+         {\pi(m,\,\mathbf{x}_m)}\cdot
+    \frac{q_d\,N_m}{q_b\,M_{m'}\,q_*(x^*)}
+  \right),
+  \label{eq:rj-raw}
+\end{equation}
+where $q_b,q_d$ are the probabilities of attempting a birth or death move and
+$\pi(m,\mathbf{x}_m)\propto p(m)\,p(\mathbf{x}_m\mid m,\kappa,\sigma)\,L(m,\mathbf{x}_m,\mu)$
+is the unnormalised posterior.  (The Jacobian of the $u\to x^*$ transformation
+cancels exactly against the proposal density by the change-of-variables
+identity $q_*(x^*)\,|dx^*/du|^{-1}=\phi(u)$.)
+
+\paragraph{Simplification via conditional prior proposal.}
+Substituting $q_*(x^*)=p(\mathbf{x}_m,x^*\mid m')/p(\mathbf{x}_m\mid m')$
+and cancelling common factors:
+\begin{equation}
+  \frac{p(\mathbf{x}_m,x^*\mid m')}
+       {q_*(x^*)\,p(\mathbf{x}_m\mid m)}
+  = \frac{p(\mathbf{x}_m\mid m')}{p(\mathbf{x}_m\mid m)}
+  \;\eqqcolon\; \mathcal{R}_\mathrm{prior},
+\end{equation}
+so the acceptance ratio reduces to
+\begin{equation}
+  \alpha_\mathrm{b} = \min\!\left(1,\;
+    \mathcal{R}_\mathrm{prior}
+    \cdot
+    \underbrace{\frac{L(m',\mathbf{x}_{m'},\mu)}
+                     {L(m,\mathbf{x}_m,\mu)}}_{\mathcal{R}_L}
+    \cdot
+    \underbrace{\frac{p(m')}{p(m)}}_{\mathcal{R}_m}
+    \cdot\frac{q_d\,N_m}{q_b\,M_{m'}}
+  \right).
+  \label{eq:rj-acc}
+\end{equation}
+The death move acceptance ratio is $\min(1,\alpha_\mathrm{b}^{-1})$.
+
+\subsection{Prior Consistency and the Approximation $\mathcal{R}_\mathrm{prior}\approx 1$}
+\label{sec:rj-prior}
+
+The term $\mathcal{R}_\mathrm{prior} = p(\mathbf{x}_m\mid m')/p(\mathbf{x}_m\mid m)$
+compares the SPDE prior on the \emph{old} nodes under the two meshes.
+For a true Mat\'ern Gaussian process, this ratio equals 1 exactly: the GP
+consistency property guarantees that the marginal at any fixed set of
+locations is determined solely by the covariance function, independent of
+which additional locations are included in the model.
+
+For the \emph{FEM-discretised} prior, however, $\mathcal{R}_\mathrm{prior}\neq 1$
+in general.  Splitting $\tau^*$ modifies the piecewise-linear basis functions
+at $v_0,v_1,v_2$: the stiffness and mass integrals over the former $\tau^*$
+are replaced by integrals over three smaller triangles, so $Q'_{-*}\neq Q$ and
+the Schur complement $Q'_\mathrm{SC} \neq Q$.  The discrepancy is
+\begin{equation}
+  Q'_\mathrm{SC} - Q \;=\;
+  \underbrace{(Q'_{-*} - Q)}_{\text{FEM change at }v_0,v_1,v_2}
+  - \frac{(Q'_{*-})^T Q'_{*-}}{Q'_{**}},
+  \label{eq:SC-diff}
+\end{equation}
+which has nonzeros only in rows/columns $\{v_0,v_1,v_2\}$ and their
+2-hop neighbours.  Both terms scale with the area $|\tau^*|$ of the split
+triangle, so $\|Q'_\mathrm{SC}-Q\|=O(|\tau^*|)$ and
+$\log\mathcal{R}_\mathrm{prior}=O(|\tau^*|^2)$.  Finer triangles produce
+smaller corrections, and the correction vanishes in the mesh-refinement limit
+as the FEM prior converges to the true Matérn GP.
+
+We therefore adopt the approximation
+\begin{equation}
+  \mathcal{R}_\mathrm{prior} \approx 1,
+  \label{eq:Rprior-approx}
+\end{equation}
+which is exact for the true GP prior and is a consistent approximation for
+the FEM prior.  The acceptance ratio simplifies to
+\begin{equation}
+  \boxed{
+  \alpha_\mathrm{b} = \min\!\left(1,\;
+    \underbrace{\frac{L(m',\mathbf{x}_{m'},\mu)}
+                     {L(m,\mathbf{x}_m,\mu)}}_{\mathcal{R}_L}
+    \cdot
+    \underbrace{\frac{p(m')}{p(m)}}_{\mathcal{R}_m}
+    \cdot\frac{q_d\,N_m}{q_b\,M_{m'}}
+  \right).}
+  \label{eq:rj-acc-simple}
+\end{equation}
+
+\begin{remark}[Exact cancellation via GP prior]
+$\mathcal{R}_\mathrm{prior}=1$ holds \emph{exactly} if the prior on every mesh
+is defined by the Mat\'ern covariance function directly---i.e.\
+$p(\mathbf{x}_m\mid m,\kappa,\sigma)=\mathcal{N}(0,\Sigma_m)$ with
+$\Sigma_{ij}=\sigma^2 C_\nu(s_i,s_j;\kappa)$---rather than by the FEM
+precision.  In that case the proposal \eqref{eq:cond-prior-rj} becomes the
+kriging predictor under the Mat\'ern covariance, replacing the local FEM
+formula with a dense covariance solve.  The FEM approximation is then used
+only for the likelihood (lumped-mass quadrature and barycentric interpolation),
+not for the prior.
+\end{remark}
+
+\subsection{Likelihood Ratio}
+\label{sec:rj-ll}
+
+Because only the triangles touching $\tau^*$ change, the log-likelihood ratio
+is local:
+\begin{equation}
+  \log\mathcal{R}_L
+  = \!\sum_{i:\,s_i\in\tau^*}\!\!\!\log\frac{\hat\lambda'(s_i)}{\hat\lambda(s_i)}
+  - \left[\tilde{c}'_{s^*}e^{\mu+x^*}
+    + \sum_{j\in\{v_0,v_1,v_2\}}\!(\tilde{c}'_{v_j}-\tilde{c}_{v_j})\,e^{\mu+x_{v_j}}\right].
+  \label{eq:rj-ll}
+\end{equation}
+The first sum covers only the $O(n/N_m)$ observations falling inside $\tau^*$,
+using barycentric weights recomputed in the new child triangles.
+
+\subsection{Mesh Prior}
+\label{sec:mesh-prior}
+
+A natural choice is a geometric prior on the number of leaf triangles:
+\begin{equation}
+  p(m) \propto \rho^{N_m-N_0}, \qquad 0<\rho<1,
+  \label{eq:mesh-prior}
+\end{equation}
+where $N_0$ is the initial triangle count and $\rho$ controls the expected
+depth of refinement.  Under \eqref{eq:mesh-prior}, $\mathcal{R}_m=\rho^2$
+for every birth move (two new leaves added).
+% ============================================================
+\section{Infinite-Dimensional Sampling Methods}
+\label{sec:inf-dim-samplers}
+% ============================================================
+
+The RJMCMC scheme of Section~\ref{sec:rjmcmc} handles the \emph{transdimensional}
+part of the posterior — deciding how many mesh nodes to use.  Within a fixed mesh,
+however, we still need to sample the field values $x \in \mathbb{R}^N$.  This
+section explains why the obvious choices (random-walk MH, vanilla HMC) become
+increasingly expensive as $N$ grows, and introduces two \emph{dimension-robust}
+alternatives that are designed from the start to work on function space.
+
+\subsection{The Curse of Discretisation}
+\label{sec:curse-disc}
+
+Fix a prior $x \sim \mathcal{N}(0, Q^{-1})$ with precision $Q \in \mathbb{R}^{N\times N}$.
+As the mesh is refined, $N\to\infty$, and the field $x$ converges to a genuine
+Gaussian process.  Standard samplers degrade:
+
+\begin{itemize}
+  \item \textbf{Random-walk MH} with isotropic proposal variance $h^2 I$:
+        the optimal acceptance rate requires $h = O(N^{-1/2})$, so the chain
+        makes $O(N)$ steps to move $O(1)$ in function space — cost $O(N)$ per
+        independent sample.
+  \item \textbf{Vanilla HMC} (mass matrix $M = I$): the leapfrog step size must
+        satisfy $\varepsilon = O(N^{-1/4})$ to keep $|\Delta H|$ bounded, so
+        $O(N^{1/4})$ steps per proposal and $O(N^{1/4})$ gradient evaluations,
+        giving $O(N^{5/4})$ cost per independent sample.
+\end{itemize}
+
+The root cause is the same in both cases: the proposal ignores the prior geometry,
+so the acceptance probability collapses in high dimensions.  The fix is to build
+the prior covariance $Q^{-1}$ directly into the proposal.
+
+\subsection{Preconditioned Crank--Nicolson (pCN)}
+\label{sec:pcn}
+
+\paragraph{Proposal.}
+For a target $\pi(x) \propto L(x)\,\mathcal{N}(x;\,0,Q^{-1})$, define:
+\begin{equation}
+  x' = \sqrt{1-\beta^2}\,x + \beta\,\xi, \qquad \xi \sim \mathcal{N}(0, Q^{-1}),
+  \label{eq:pcn-proposal}
+\end{equation}
+where $\beta \in (0,1]$ is a step-size parameter.
+
+\paragraph{Why it works.}
+The Crank--Nicolson interpolation \eqref{eq:pcn-proposal} exactly preserves
+$\mathcal{N}(0, Q^{-1})$: if $x$ is distributed as the prior, so is $x'$.
+Consequently, the prior log-density cancels in the Metropolis--Hastings ratio and
+only the likelihood ratio survives:
+\begin{equation}
+  \alpha(x, x') = \min\!\left(1,\, \frac{L(x')}{L(x)}\right).
+  \label{eq:pcn-alpha}
+\end{equation}
+The acceptance rate therefore depends only on $L$, not on $N$: choosing $\beta$
+once for a coarse mesh yields the same acceptance on a fine mesh.  This
+\emph{dimension-robustness} is the defining property of pCN
+\citep{cotter2013}.
+
+\paragraph{Implementation.}
+Sampling $\xi \sim \mathcal{N}(0, Q^{-1})$ amounts to solving the sparse linear
+system $Q\,\xi = z$ for $z \sim \mathcal{N}(0,I)$, which can be done with
+conjugate gradient (CG) in $O(N)$ time for a graph-Laplacian precision (see
+Section~\ref{sec:cg}).
+
+\subsection{Hilbert-Space HMC}
+\label{sec:hilbert-hmc}
+
+pCN is robust but uses only first-order (likelihood evaluation) information.
+Hilbert-space HMC incorporates gradient information while retaining
+dimension-robustness \citep{beskos2011}.
+
+\paragraph{Velocity parameterisation.}
+Standard HMC introduces a momentum $p \sim \mathcal{N}(0, M)$ and
+Hamiltonians $H = U(x) + \tfrac{1}{2}p^\top M^{-1} p$.  Setting $M = Q$
+and changing variables to $v = Q^{-1}p$ (so $v \sim \mathcal{N}(0, Q^{-1})$):
+\begin{align}
+  H(x,v) &= U(x) + K(v), \\
+  U(x)   &= -\log L(x) + \tfrac{1}{2} x^\top Q x, \label{eq:hmc-U}\\
+  K(v)   &= \tfrac{1}{2} v^\top Q v. \label{eq:hmc-K}
+\end{align}
+Hamilton's equations become $\dot{x} = v$ and $Q\dot{v} = -\nabla U(x)$.
+
+\paragraph{Leapfrog integrator.}
+With step size $\varepsilon$ and $L$ leapfrog steps:
+\begin{align}
+  v &\leftarrow v - \tfrac{\varepsilon}{2}\, Q^{-1}\nabla U(x) \tag{half kick}\\
+  \text{for } & i = 1,\ldots, L-1: \notag\\
+  & x \leftarrow x + \varepsilon\, v \tag{drift}\\
+  & v \leftarrow v - \varepsilon\, Q^{-1}\nabla U(x) \tag{full kick}\\
+  x &\leftarrow x + \varepsilon\, v \tag{final drift}\\
+  v &\leftarrow v - \tfrac{\varepsilon}{2}\, Q^{-1}\nabla U(x). \tag{final half kick}
+\end{align}
+Each ``kick'' requires one solve $Q^{-1}b$; each drift requires only a
+vector addition.  The kinetic energy $K(v) = \tfrac{1}{2}v^\top Qv$ needs only
+a matrix–vector product $Qv$, not a solve.
+
+\paragraph{Why the velocity form is preferable.}
+Three advantages over the standard $(x, p)$ form with $M = Q$:
+\begin{enumerate}
+  \item $K(v) = \tfrac{1}{2}v^\top Qv$ — computed with one sparse mat-vec, no
+        matrix inverse.
+  \item Velocity refresh $v \sim \mathcal{N}(0, Q^{-1})$ uses \emph{exactly} the same
+        CG solve as prior sampling — no Cholesky, no dense matrix stored.
+  \item All $O(N^2)$--$O(N^3)$ dense-algebra is replaced by $O(N \times
+        \text{CG iters})$ sparse work.
+\end{enumerate}
+
+\paragraph{Dimension-robustness.}
+With $M = Q$, the leapfrog step size can be chosen independently of $N$ (the
+eigenmodes of $Q$ all enter the dynamics on the same footing).  In practice
+one observes $|\Delta H| = O(1)$ and acceptance $\approx 65$--$80\,\%$ regardless
+of mesh size, provided $\varepsilon$ is tuned on a coarse mesh \citep{beskos2011,
+hairer2014}.
+
+\paragraph{CG for $Q^{-1}b$.}
+\label{sec:cg}
+For the Besag CAR prior $Q = \kappa^2 I + L_{\rm graph}$, where $L_{\rm graph}$
+is the graph Laplacian of the mesh connectivity, the condition number satisfies
+\begin{equation}
+  \kappa(Q) = \frac{\kappa^2 + \lambda_{\max}(L_{\rm graph})}{\kappa^2}
+            \approx \frac{\kappa^2 + 8}{\kappa^2}
+\end{equation}
+for a 4-connected grid (eigenvalues of $L_{\rm graph}$ lie in $[0,8]$).  This is
+\emph{independent of $N$}, so CG converges in $O(1)$ iterations and each leapfrog
+step costs $O(N)$.  For the FEM precision matrix derived from the SPDE operator
+(companion \emph{Foundations} note), the same argument holds with $\kappa^2$
+replacing 8 as the dominant eigenvalue bound.
+
+\subsection{Combining Hilbert-Space HMC with RJMCMC}
+\label{sec:rjmcmc-hmc}
+
+The overall algorithm separates into two nested move types:
+
+\begin{description}
+  \item[\textbf{Within-model move}] (fixed $N_m$): one Hilbert-space HMC step in
+    $(x, v)$ space.  Gradient information from the likelihood accelerates mixing;
+    the $Q$-preconditioned leapfrog keeps $\varepsilon$ mesh-size-independent.
+  \item[\textbf{Transdimensional move}] (birth or death): one RJMCMC step as in
+    Section~\ref{sec:rjmcmc}.  On acceptance, the field $x$ and precision $Q$
+    change dimension.  The velocity $v$ is refreshed by drawing
+    $v_{\rm new} \sim \mathcal{N}(0, Q_{\rm new}^{-1})$
+    (one CG solve in the new space) before the next HMC step.
+\end{description}
+
+\begin{algorithm}[H]
+\caption{Joint RJMCMC + Hilbert-Space HMC}
+\label{alg:rj-hmc}
+\begin{algorithmic}[1]
+  \State \textbf{Initialise:} mesh $\mathcal{T}_0$, $x^{(0)} \sim \mathcal{N}(0, Q_0^{-1})$,
+         $v^{(0)} \sim \mathcal{N}(0, Q_0^{-1})$
+  \For{$t = 1, 2, \ldots$}
+    \State Draw $u \sim \mathrm{Uniform}(0,1)$
+    \If{$u < p_{\rm trans}$}  \Comment{transdimensional move}
+      \State Propose birth/death $(\mathcal{T}, x) \to (\mathcal{T}', x')$ \hfill (Section~\ref{sec:rjmcmc})
+      \State Accept with probability $\min(1,\, \mathcal{R}_L \cdot \mathcal{R}_m \cdot \mathcal{R}_J)$
+      \If{accepted}
+        \State $v \leftarrow Q'^{-1} z$, \;$z \sim \mathcal{N}(0, I)$
+        \hfill (velocity refresh via CG)
+      \EndIf
+    \Else \Comment{within-model move}
+      \State $v \leftarrow Q^{-1}z$, \;$z \sim \mathcal{N}(0, I)$
+            \hfill (velocity refresh)
+      \State Run $L$-step leapfrog to propose $(x', v')$
+      \State Accept with probability $\min(1,\, e^{-\Delta H})$
+    \EndIf
+  \EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\noindent
+The mixing-time scales of the two move types are naturally separated: HMC
+explores the field posterior quickly (correlated draws in $O(1)$ steps) while
+RJMCMC explores mesh complexity slowly (each birth/death requires a Jacobian
+factor).  The fraction $p_{\rm trans}$ controls the trade-off; a common heuristic
+is $p_{\rm trans} \approx 0.1$.
+
+\subsection{Annotated Reading List}
+\label{sec:reading-list}
+
+\begin{description}
+  \item[\citet{stuart2010}] The foundational reference for Bayesian inversion on
+    function space.  Section 4 defines Gaussian priors on Hilbert spaces and makes
+    precise what it means for a posterior to be well-posed in infinite dimensions.
+    Read this first to understand \emph{why} dimension-robustness is the right
+    criterion.
+
+  \item[\citet{cotter2013}] Derives pCN and its acceptance formula \eqref{eq:pcn-alpha},
+    proves dimension-robustness, and compares it to a function-space version of
+    the Langevin algorithm (MALA).  Includes numerical experiments on an elliptic
+    inverse problem showing acceptance rates stable as $N \to \infty$.
+
+  \item[\citet{beskos2011}] Introduces the Hilbert-space HMC (called ``Hybrid Monte
+    Carlo on Hilbert spaces'').  Proves that with the prior as mass matrix the
+    step size can be held fixed as $N \to \infty$ and that the acceptance
+    probability remains bounded away from zero.  The velocity parameterisation
+    used here follows their exposition.
+
+  \item[\citet{hairer2014}] Provides spectral-gap bounds for pCN and related
+    infinite-dimensional Metropolis algorithms, giving a rigorous convergence rate
+    in terms of the likelihood Lipschitz constant.  Useful background if you want
+    to understand \emph{how fast} the chain mixes in theory.
+
+  \item[\citet{neal2011}] The standard handbook chapter on HMC; covers the
+    leapfrog integrator, step-size tuning, and the dual-averaging adaptation used
+    in NUTS.  Read before \citet{beskos2011} to understand the finite-dimensional
+    version.
+
+  \item[\citet{green1995}] Original RJMCMC paper.  Introduces the general
+    reversible-jump framework and the Jacobian term $\mathcal{R}_J$; the birth/death
+    moves of Section~\ref{sec:rjmcmc} are a special case.
+\end{description}
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}
