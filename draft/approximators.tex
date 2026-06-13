@@ -665,13 +665,32 @@ generating the same leaf \emph{partition} $\{C_i\}$.  In both cases the honest
 index is geometric (the state vector / the leaf box), not the tree.
 \end{remark}
 
-The fix is identical to Section~\ref{sec:uniqueness}: impose the total order
-$1<2<\cdots<D$ and keep the canonical (sorted) split history, equivalently demote
-the highest-indexed cut via the canonical parent \eqref{eq:canon-parent}.  The
-state-local admissibility rule \eqref{eq:canon-birth-rule} carries over verbatim
---- within a cell's split lineage, a cut in dimension $d$ is allowed only if no
-higher-indexed dimension has been cut --- making the tree-to-partition map a
-bijection and removing the double-counting from the RJMCMC move counts.
+The same canonical labelling of Section~\ref{sec:uniqueness} applies, but with
+one caveat that does \emph{not} arise for the hat tree.  Imposing the total order
+$1<2<\cdots<D$ and keeping only the canonical (sorted) split history --- the
+state-local rule that, within a cell's split lineage, a cut in dimension $d$ is
+admissible only if no higher-indexed dimension has been cut
+(Eq.~\eqref{eq:canon-birth-rule}, equivalently the canonical parent
+\eqref{eq:canon-parent}) --- does make the tree-to-partition map injective.  The
+subtlety is that, unlike the hat tree where the sorted shuffle reaches
+\emph{every} state vector, this restriction also \emph{shrinks the family of
+reachable partitions}: once a branch has cut a higher-indexed axis it can never
+re-split a lower-indexed one within that subtree, so partitions that genuinely
+require interleaved cuts down a single branch become unreachable.  The canonical
+rule is therefore a bijection onto the \emph{canonically reachable} partitions, a
+strict subfamily, rather than a faithful relabelling of all dyadic-box
+partitions.
+
+Two consequences for the RJMCMC sampler follow.  If one is content to explore
+only the canonically reachable subfamily, applying
+Eq.~\eqref{eq:canon-birth-rule} as a state-local birth restriction removes the
+cross-dimensional double-counting at no extra bookkeeping cost.  To retain the
+\emph{full} partition family without double-counting, the canonicalisation must
+instead be done at the level of the partition itself --- e.g.\ comparing a
+proposed split's resulting leaf set against a canonical (say, guillotine-ordered)
+representative --- rather than by the per-lineage sorted-cut rule.  In the
+implementation the sorted-cut rule is exposed as an opt-in helper for this
+reason.
 
 % ============================================================
 \section{Baseline (Level 1): Adaptive Triangulation FEM}
